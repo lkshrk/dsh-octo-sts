@@ -1,0 +1,5 @@
+# dsh-octo-sts bundle layer: off until a profile enables it and configures its scope and identity.
+- insert:
+    - id: dsh-octo-sts
+      name: dsh-octo-sts
+      disabled: true
