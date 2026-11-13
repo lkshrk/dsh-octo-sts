@@ -29,14 +29,14 @@ It runs in the control-plane process only, never in sandboxes.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `sts` | `https://sts.h-cloud.io` | Base URL of the octo-sts instance (https only) |
+| `sts` | `https://sts.h-cloud.io` | octo-sts server root: https, no credentials, path, query or fragment. Redirects are refused |
 | `scope` | required | octo-sts scope: an organization or `owner/repo` |
 | `identity` | required | Trust policy name: octo-sts reads `.github/chainguard/<identity>.sts.yaml` in the scope's policy repository |
 | `identityTokenFile` | `/var/run/secrets/octo-sts/token` | The projected service account token, read fresh on every exchange |
-| `refreshMinutes` | `30` | Exchange interval, 5 to 55 minutes |
+| `refreshMinutes` | `30` | Exchange interval, 5 to 45 minutes, counted from the moment each exchange starts |
 | `workspaces` | `[]` | Repository URLs of registered dsh-yawn Workspaces that receive the token as a workspace secret |
 | `secretName` | `GITHUB_TOKEN` | Name of that workspace secret |
-| `tokenFile` | none | Absolute path the token is also written to, mode 0600, replaced atomically |
+| `tokenFile` | none | Absolute path the token is also written to: created with mode 0600 under a random temporary name, then renamed over the old file. A missing parent directory is created with mode 0700 |
 
 At least one of `workspaces` and `tokenFile` must be set. Unknown keys are refused.
 
@@ -53,11 +53,15 @@ The file appears after the first exchange, a few seconds after dsh starts. A wra
 
 ## Behaviour
 
-- **Rounds.** The first exchange runs as soon as the plugin starts, then every `refreshMinutes`. Each round reads the identity token file, calls `GET <sts>/sts/exchange?scope=<scope>&identity=<identity>` with `Authorization: Bearer <identity token>`, writes the token file and then sets the secret on each workspace.
+- **Exchange.** The first exchange runs as soon as the plugin starts, then every `refreshMinutes`. Each one reads the identity token file and calls `GET <sts>/sts/exchange?scope=<scope>&identity=<identity>` with `Authorization: Bearer <identity token>`.
+- **Destinations.** The token file and each workspace are separate destinations. A new token goes to every destination; a destination that already holds the current token is not written again.
 - **Delivery to sandboxes.** dsh-yawn re-reads its secret store before every sandbox command, so running and new sandboxes get the new token at their next command without a restart. A single command that runs past the token's expiry keeps the old value.
-- **Failures.** A failed round keeps the previous token where it is; it stays valid until its hour is up. The plugin retries after 1, 2 and 4 minutes, then every 5 minutes, until a round succeeds. A round that wrote the file but could not set a workspace secret counts as failed and is retried as a whole.
-- **Logs.** One line per round: info on success, a warning while the previous token is still valid, an error once it has expired. Token values are never logged; any that appear in an error message are replaced with `[redacted]`.
-- **Errors never escape.** dsh ends its process on an unhandled rejection, so every failure stays inside the loop. Disposing the plugin stops the timer and waits for a round in flight.
+- **Failures.** Nothing is ever removed: every destination keeps its last token, which stays valid until its hour is up.
+  - A failed exchange is retried after 1, 2 and 4 minutes, then every 5 minutes.
+  - A destination that could not be written gets the same token again on that backoff, without a new exchange. The others keep their schedule.
+  - A Workspace dsh-yawn does not know (`workspace is not registered`) is not retried until the next exchange.
+- **Logs.** Successful exchanges log at info. A failure logs a warning naming the failed exchange or destinations while any destination still holds a valid token, and an error once none does. Token values are never logged; any that appear in an error message are replaced with `[redacted]`. The logs are the plugin's only health report.
+- **Errors never escape.** dsh ends its process on an unhandled rejection, so every failure stays inside the loop. Disposing the plugin stops the timer, waits for a round in flight and does not deliver its token.
 
 ## Trust policy
 

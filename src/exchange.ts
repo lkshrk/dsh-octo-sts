@@ -12,6 +12,7 @@ export async function exchange(request: ExchangeRequest, identityToken: string, 
   url.searchParams.set('scope', request.scope)
   url.searchParams.set('identity', request.identity)
   const response = await fetcher(url, {
+    redirect: 'error',
     headers: { authorization: `Bearer ${identityToken}`, accept: 'application/json' },
     signal: AbortSignal.any([signal, AbortSignal.timeout(EXCHANGE_TIMEOUT_MS)]),
   })

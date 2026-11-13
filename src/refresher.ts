@@ -1,4 +1,6 @@
-import { chmod, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
+import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
+import { dirname } from 'node:path'
 import type { OctoStsConfig } from './config.ts'
 import { exchange } from './exchange.ts'
 
@@ -15,62 +17,75 @@ export interface RefresherDependencies {
   fetch?: typeof fetch
   now?: () => number
 }
-export interface Health { state: 'starting' | 'ready' | 'failing' | 'expired' | 'stopped'; detail: string; failures: number; refreshedAt?: string; expiresAt?: string }
+
+export class PermanentError extends Error {}
+
+interface Destination { label: string; write(token: string): Promise<void> }
+interface Delivery { issuedAt?: number; error?: string; permanent?: boolean }
+interface Issued { token: string; issuedAt: number }
 
 export const retryDelayMs = (failures: number): number => Math.min(FIRST_RETRY_MS * 2 ** Math.max(failures - 1, 0), MAX_RETRY_MS)
 
 export async function writeTokenFile(path: string, token: string): Promise<void> {
-  const temporary = `${path}.${process.pid}.tmp`
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+  const temporary = `${path}.${randomBytes(8).toString('hex')}.tmp`
+  let created = false
   try {
-    await writeFile(temporary, token, { mode: 0o600 })
-    await chmod(temporary, 0o600)
+    const handle = await open(temporary, 'wx', 0o600)
+    created = true
+    try {
+      await handle.writeFile(token)
+    } finally {
+      await handle.close()
+    }
     await rename(temporary, path)
   } catch (error) {
-    await rm(temporary, { force: true })
+    if (created) await rm(temporary, { force: true })
     throw error
   }
 }
 
-export async function refreshOnce(config: OctoStsConfig, dependencies: RefresherDependencies, signal: AbortSignal): Promise<void> {
-  const secrets: string[] = []
-  try {
-    const identityToken = (await readFile(config.identityTokenFile, 'utf8')).trim()
-    if (!identityToken) throw new Error(`${config.identityTokenFile} is empty`)
-    secrets.push(identityToken)
-    const token = await exchange(config, identityToken, dependencies.fetch ?? fetch, signal)
-    secrets.push(token)
-    const failures: string[] = []
-    if (config.tokenFile) await writeTokenFile(config.tokenFile, token).catch((error: unknown) => { failures.push(`${config.tokenFile}: ${message(error)}`) })
-    if (config.workspaces.length > 0) {
-      const store = dependencies.store()
-      if (!store) failures.push('the sandboxManager service is not available')
-      else for (const workspace of config.workspaces) {
-        await withTimeout(Promise.resolve().then(() => store.setWorkspaceSecret(workspace, config.secretName, token)), `${workspace}: timed out`)
-          .catch((error: unknown) => { failures.push(`${workspace}: ${message(error)}`) })
-      }
-    }
-    if (failures.length > 0) throw new Error(`could not store the token: ${failures.join('; ')}`)
-  } catch (error) {
-    throw new Error(secrets.reduce((text, secret) => text.replaceAll(secret, '[redacted]'), message(error)))
+export async function readIdentityToken(path: string): Promise<string> {
+  const token = (await readFile(path, 'utf8')).trim()
+  if (!token) throw new Error(`${path} is empty`)
+  return token
+}
+
+function destinations(config: OctoStsConfig, store: () => SecretStore | undefined): Destination[] {
+  const result: Destination[] = []
+  if (config.tokenFile) {
+    const path = config.tokenFile
+    result.push({ label: path, write: token => writeTokenFile(path, token) })
   }
+  for (const workspace of new Set(config.workspaces)) {
+    result.push({ label: workspace, write: async token => {
+      const service = store()
+      if (!service) throw new Error('the sandboxManager service is not available')
+      try {
+        await withTimeout(Promise.resolve().then(() => service.setWorkspaceSecret(workspace, config.secretName, token)), 'timed out')
+      } catch (error) {
+        if (/workspace is not registered/.test(message(error))) throw new PermanentError(message(error))
+        throw error
+      }
+    } })
+  }
+  return result
 }
 
 export class TokenRefresher {
   private readonly controller = new AbortController()
+  private readonly targets: Destination[]
+  private readonly deliveries = new Map<string, Delivery>()
   private timer: NodeJS.Timeout | undefined
   private running: Promise<void> | undefined
+  private current: Issued | undefined
   private failures = 0
-  private refreshedAt: number | undefined
-  private status: Health = { state: 'starting', detail: 'waiting for the first exchange', failures: 0 }
 
-  constructor(private readonly config: OctoStsConfig, private readonly dependencies: RefresherDependencies) {}
+  constructor(private readonly config: OctoStsConfig, private readonly dependencies: RefresherDependencies) {
+    this.targets = destinations(config, dependencies.store)
+  }
 
   start(): void { this.schedule(0) }
-
-  health(): Health {
-    const lapsed = this.status.state === 'failing' && this.status.expiresAt !== undefined && Date.parse(this.status.expiresAt) <= this.now()
-    return { ...this.status, state: lapsed ? 'expired' : this.status.state }
-  }
 
   async settled(): Promise<void> { await this.running }
 
@@ -78,8 +93,10 @@ export class TokenRefresher {
     this.controller.abort()
     clearTimeout(this.timer)
     await this.running
-    this.status = { ...this.status, state: 'stopped', detail: 'stopped' }
+    this.current = undefined
   }
+
+  private get interval(): number { return this.config.refreshMinutes * 60_000 }
 
   private now(): number { return (this.dependencies.now ?? Date.now)() }
 
@@ -90,38 +107,64 @@ export class TokenRefresher {
   }
 
   private async round(): Promise<void> {
-    let delay: number
-    try {
-      await refreshOnce(this.config, this.dependencies, this.controller.signal)
-      delay = this.config.refreshMinutes * 60_000
-      this.succeeded(delay)
-    } catch (error) {
-      if (this.controller.signal.aborted) return
-      this.failures += 1
-      delay = retryDelayMs(this.failures)
-      this.failed(message(error), delay)
+    const due = !this.current || this.now() >= this.current.issuedAt + this.interval
+    let exchangeError: string | undefined
+    if (due) {
+      const issuedAt = this.now()
+      let identityToken: string | undefined
+      try {
+        identityToken = await readIdentityToken(this.config.identityTokenFile)
+        this.current = { token: await exchange(this.config, identityToken, this.dependencies.fetch ?? fetch, this.controller.signal), issuedAt }
+      } catch (error) {
+        exchangeError = redact(message(error), [identityToken])
+      }
     }
-    this.schedule(delay)
+    if (this.controller.signal.aborted) return
+    const fresh = due && exchangeError === undefined
+    const current = this.current
+    if (current) {
+      for (const target of this.targets) {
+        const delivery = this.deliveries.get(target.label) ?? {}
+        if (delivery.issuedAt === current.issuedAt || (delivery.permanent && !fresh)) continue
+        try {
+          await target.write(current.token)
+          this.deliveries.set(target.label, { issuedAt: current.issuedAt })
+        } catch (error) {
+          this.deliveries.set(target.label, { issuedAt: delivery.issuedAt, error: redact(message(error), [current.token]), permanent: error instanceof PermanentError })
+        }
+        if (this.controller.signal.aborted) return
+      }
+    }
+    this.schedule(this.report(fresh, exchangeError))
   }
 
-  private succeeded(delay: number): void {
+  private report(fresh: boolean, exchangeError: string | undefined): number {
+    const now = this.now()
+    const failed = this.targets.flatMap(target => {
+      const delivery = this.deliveries.get(target.label)
+      return delivery?.error === undefined || delivery.issuedAt === this.current?.issuedAt ? [] : [{ label: target.label, ...delivery }]
+    })
+    const retrying = exchangeError !== undefined || failed.some(delivery => !delivery.permanent)
     const recovered = this.failures
-    this.failures = 0
-    this.refreshedAt = this.now()
-    const expiresAt = new Date(this.refreshedAt + TOKEN_LIFETIME_MS).toISOString()
-    this.status = { state: 'ready', detail: 'token refreshed', failures: 0, refreshedAt: new Date(this.refreshedAt).toISOString(), expiresAt }
-    this.log('info', 'dsh-octo-sts: refreshed the token for %s/%s%s; next refresh in %d min', this.config.scope, this.config.identity,
-      recovered > 0 ? ` after ${recovered} failed attempts` : '', Math.round(delay / 60_000))
-  }
-
-  private failed(detail: string, delay: number): void {
-    const expiresAt = this.refreshedAt === undefined ? undefined : this.refreshedAt + TOKEN_LIFETIME_MS
-    const valid = expiresAt !== undefined && expiresAt > this.now()
-    this.status = { state: valid ? 'failing' : 'expired', detail, failures: this.failures,
-      refreshedAt: this.refreshedAt === undefined ? undefined : new Date(this.refreshedAt).toISOString(),
-      expiresAt: expiresAt === undefined ? undefined : new Date(expiresAt).toISOString() }
-    const kept = valid ? `the previous token stays valid until ${new Date(expiresAt).toISOString()}` : 'no valid token is held'
-    this.log(valid ? 'warn' : 'error', 'dsh-octo-sts: refresh %d failed, retrying in %d s; %s: %s', this.failures, Math.round(delay / 1000), kept, detail)
+    this.failures = retrying ? this.failures + 1 : 0
+    const delay = retrying || !this.current ? retryDelayMs(this.failures) : Math.max(this.current.issuedAt + this.interval - now, 0)
+    const problems = [...exchangeError === undefined ? [] : [`exchange failed: ${exchangeError}`],
+      ...failed.map(delivery => `${delivery.label}${delivery.permanent ? ' (retried at the next exchange)' : ''}: ${delivery.error}`)]
+    const name = `${this.config.scope}/${this.config.identity}`
+    if (problems.length === 0) {
+      if (fresh || recovered > 0) {
+        this.log('info', 'dsh-octo-sts: %s token delivered to every destination%s; next exchange in %d min', name,
+          recovered > 0 ? ` after ${recovered} failed attempts` : '', Math.round(delay / 60_000))
+      }
+      return delay
+    }
+    const valid = this.targets.some(target => {
+      const issuedAt = this.deliveries.get(target.label)?.issuedAt
+      return issuedAt !== undefined && issuedAt + TOKEN_LIFETIME_MS > now
+    })
+    this.log(valid ? 'warn' : 'error', 'dsh-octo-sts: %s %s; %s; next attempt in %d s', name, problems.join('; '),
+      valid ? 'destinations keep their last token until it expires' : 'no destination holds a valid token', Math.round(delay / 1000))
+    return delay
   }
 
   private log(level: keyof Logger, format: string, ...args: unknown[]): void {
@@ -129,6 +172,10 @@ export class TokenRefresher {
       this.dependencies.logger[level](format, ...args)
     } catch { /* a logger failure must not stop the loop */ }
   }
+}
+
+function redact(text: string, secrets: (string | undefined)[]): string {
+  return secrets.reduce<string>((result, secret) => secret ? result.replaceAll(secret, '[redacted]') : result, text)
 }
 
 function message(error: unknown): string {

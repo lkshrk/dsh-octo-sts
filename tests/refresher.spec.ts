@@ -1,14 +1,17 @@
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { format } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { OctoStsConfigSchema, type OctoStsConfig } from '../src/config.ts'
 import { exchange } from '../src/exchange.ts'
-import { TokenRefresher, refreshOnce, retryDelayMs, writeTokenFile, type SecretStore } from '../src/refresher.ts'
+import { TokenRefresher, readIdentityToken, retryDelayMs, writeTokenFile, type SecretStore } from '../src/refresher.ts'
 import { apply, Config } from '../src/index.ts'
 
 const WORKSPACE = 'https://github.com/acme/widgets'
+const OTHER = 'https://github.com/acme/other'
 const IDENTITY_TOKEN = 'eyJ.identity.jwt'
+const MIN = 60_000
 let dir: string
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'octo-sts-'))
@@ -21,57 +24,84 @@ afterEach(() => {
 
 const config = (overrides: Record<string, unknown> = {}): OctoStsConfig => OctoStsConfigSchema.parse({
   sts: 'https://sts.example.test', scope: 'acme', identity: 'dsh-yawn', identityTokenFile: join(dir, 'sa-token'),
-  workspaces: [WORKSPACE], tokenFile: join(dir, 'gh.token'), ...overrides })
+  workspaces: [WORKSPACE], tokenFile: join(dir, 'run', 'gh.token'), ...overrides })
+const tokenFile = () => readFileSync(join(dir, 'run', 'gh.token'), 'utf8')
 
-function sts(answers: (() => Response)[] = []) {
+type Answer = () => Response | Promise<Response>
+function sts() {
   let issued = 0
-  const calls: { url: URL; headers: Record<string, string> }[] = []
+  const answers: Answer[] = []
+  const calls: { url: URL; init: RequestInit }[] = []
   const fetcher = vi.fn(async (url: string | URL | Request, init: RequestInit = {}) => {
-    calls.push({ url: new URL(String(url)), headers: init.headers as Record<string, string> })
+    calls.push({ url: new URL(String(url)), init })
     const answer = answers.shift()
-    if (answer) return answer()
-    return Response.json({ token: `ghs_token${++issued}` })
+    return answer ? await answer() : Response.json({ token: `ghs_token${++issued}` })
   })
-  return { fetcher: fetcher as unknown as typeof fetch, calls }
+  return { fetcher: fetcher as unknown as typeof fetch, calls, answers }
 }
+const refused = (status = 503, text = 'unavailable'): Answer => () => Response.json({ message: text }, { status })
 
-function store(fail?: () => Error) {
+function store() {
   const secrets = new Map<string, string>()
-  const value: SecretStore = {
-    setWorkspaceSecret: vi.fn(async (url: string, name: string, secret: string) => {
-      if (fail) throw fail()
-      secrets.set(`${url} ${name}`, secret)
-      return {}
-    }),
-  }
-  return { value, secrets }
+  const failures = new Map<string, () => Error>()
+  const setWorkspaceSecret = vi.fn(async (url: string, name: string, secret: string) => {
+    const failure = failures.get(url)
+    if (failure) throw failure()
+    secrets.set(`${url} ${name}`, secret)
+    return {}
+  })
+  return { value: { setWorkspaceSecret } as SecretStore, secrets, failures, setWorkspaceSecret }
 }
 
-const logger = () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() })
-const logged = (log: ReturnType<typeof logger>) => JSON.stringify([log.info.mock.calls, log.warn.mock.calls, log.error.mock.calls])
-const signal = () => new AbortController().signal
-async function advance(refresher: TokenRefresher, ms: number) {
-  for (let left = ms; ; left -= 1_000) {
-    await vi.advanceTimersByTimeAsync(Math.min(left, 1_000))
-    await refresher.settled()
-    if (left <= 1_000) return
+function logger() {
+  const lines: { level: string; text: string }[] = []
+  const at = (level: string) => vi.fn((pattern: string, ...args: unknown[]) => { lines.push({ level, text: format(pattern, ...args) }) })
+  return { info: at('info'), warn: at('warn'), error: at('error'), lines }
+}
+
+function harness(overrides: Record<string, unknown> = {}) {
+  vi.useFakeTimers()
+  const server = sts()
+  const secrets = store()
+  const log = logger()
+  const refresher = new TokenRefresher(config(overrides), { store: () => secrets.value, logger: log, fetch: server.fetcher, now: Date.now })
+  const advance = async (ms: number) => {
+    for (let left = ms; ; left -= 1_000) {
+      await vi.advanceTimersByTimeAsync(Math.min(left, 1_000))
+      await refresher.settled()
+      if (left <= 1_000) return
+    }
   }
+  return { refresher, server, secrets, log, advance }
 }
 
 describe('config', () => {
+  const base = { scope: 'acme', identity: 'dsh-yawn', workspaces: [WORKSPACE] }
+
   it('applies the defaults', () => {
-    const parsed = OctoStsConfigSchema.parse({ scope: 'acme', identity: 'dsh-yawn', workspaces: [WORKSPACE] })
+    const parsed = OctoStsConfigSchema.parse(base)
     expect(parsed).toMatchObject({ sts: 'https://sts.h-cloud.io', identityTokenFile: '/var/run/secrets/octo-sts/token', refreshMinutes: 30, secretName: 'GITHUB_TOKEN' })
     expect(parsed.tokenFile).toBeUndefined()
   })
 
-  it('refuses an identity that is not one path segment, relative paths, plain http and unknown keys', () => {
-    const base = { scope: 'acme', identity: 'dsh-yawn', workspaces: [WORKSPACE] }
+  it('refuses an identity that is not one path segment, relative paths and unknown keys', () => {
     for (const identity of ['a/b', '..', '.', 'a b', '']) expect(OctoStsConfigSchema.safeParse({ ...base, identity }).success).toBe(false)
     expect(OctoStsConfigSchema.safeParse({ ...base, tokenFile: 'gh.token' }).success).toBe(false)
-    expect(OctoStsConfigSchema.safeParse({ ...base, sts: 'http://sts.example.test' }).success).toBe(false)
+    expect(OctoStsConfigSchema.safeParse({ ...base, identityTokenFile: 'token' }).success).toBe(false)
     expect(OctoStsConfigSchema.safeParse({ ...base, extra: true }).success).toBe(false)
-    expect(OctoStsConfigSchema.safeParse({ ...base, refreshMinutes: 60 }).success).toBe(false)
+  })
+
+  it('accepts only an https server root without credentials as sts', () => {
+    expect(OctoStsConfigSchema.safeParse({ ...base, sts: 'https://sts.example.test/' }).success).toBe(true)
+    for (const sts of ['http://sts.example.test', 'https://user:pass@sts.example.test', 'https://user@sts.example.test',
+      'https://sts.example.test/prefix', 'https://sts.example.test/?a=1', 'https://sts.example.test/#x']) {
+      expect(OctoStsConfigSchema.safeParse({ ...base, sts }).success, sts).toBe(false)
+    }
+  })
+
+  it('keeps the refresh interval between 5 and 45 minutes', () => {
+    expect(OctoStsConfigSchema.safeParse({ ...base, refreshMinutes: 45 }).success).toBe(true)
+    for (const refreshMinutes of [4, 46, 10.5]) expect(OctoStsConfigSchema.safeParse({ ...base, refreshMinutes }).success).toBe(false)
   })
 
   it('needs somewhere to put the token', () => {
@@ -85,160 +115,246 @@ describe('config', () => {
 })
 
 describe('exchange', () => {
-  it('sends the identity token as a bearer with scope and identity', async () => {
+  const signal = () => new AbortController().signal
+
+  it('sends the identity token as a bearer with scope and identity and refuses redirects', async () => {
     const { fetcher, calls } = sts()
     await expect(exchange(config(), IDENTITY_TOKEN, fetcher, signal())).resolves.toBe('ghs_token1')
     expect(calls[0]!.url.toString()).toBe('https://sts.example.test/sts/exchange?scope=acme&identity=dsh-yawn')
-    expect(calls[0]!.headers.authorization).toBe(`Bearer ${IDENTITY_TOKEN}`)
+    expect((calls[0]!.init.headers as Record<string, string>).authorization).toBe(`Bearer ${IDENTITY_TOKEN}`)
+    expect(calls[0]!.init.redirect).toBe('error')
   })
 
   it('reports the status and octo-sts message on refusal', async () => {
-    const { fetcher } = sts([() => Response.json({ code: 16, message: 'unable to verify bearer token' }, { status: 401 })])
+    const { fetcher, answers } = sts()
+    answers.push(refused(401, 'unable to verify bearer token'))
     await expect(exchange(config(), IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('octo-sts answered 401: unable to verify bearer token')
   })
 
   it('refuses an answer without a token', async () => {
-    const { fetcher } = sts([() => Response.json({ token: '' })])
+    const { fetcher, answers } = sts()
+    answers.push(() => Response.json({ token: '' }), () => new Response('not json'))
+    await expect(exchange(config(), IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('without a token')
     await expect(exchange(config(), IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('without a token')
   })
 })
 
-describe('refreshOnce', () => {
-  it('writes the token to every workspace and to a 0600 file', async () => {
-    const { fetcher } = sts()
-    const { value, secrets } = store()
-    await refreshOnce(config({ workspaces: [WORKSPACE, 'https://github.com/acme/other'] }), { store: () => value, logger: logger(), fetch: fetcher }, signal())
-    expect(secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
-    expect(secrets.get('https://github.com/acme/other GITHUB_TOKEN')).toBe('ghs_token1')
-    expect(readFileSync(join(dir, 'gh.token'), 'utf8')).toBe('ghs_token1')
-    expect(statSync(join(dir, 'gh.token')).mode & 0o777).toBe(0o600)
-  })
-
-  it('reads the identity token file fresh each round', async () => {
-    const { fetcher, calls } = sts()
-    const { value } = store()
-    const dependencies = { store: () => value, logger: logger(), fetch: fetcher }
-    await refreshOnce(config(), dependencies, signal())
-    writeFileSync(join(dir, 'sa-token'), 'eyJ.rotated.jwt')
-    await refreshOnce(config(), dependencies, signal())
-    expect(calls.map(call => call.headers.authorization)).toEqual([`Bearer ${IDENTITY_TOKEN}`, 'Bearer eyJ.rotated.jwt'])
-  })
-
-  it('still writes the file when sandboxManager is missing, and fails the round', async () => {
-    const { fetcher } = sts()
-    await expect(refreshOnce(config(), { store: () => undefined, logger: logger(), fetch: fetcher }, signal())).rejects.toThrow('sandboxManager')
-    expect(readFileSync(join(dir, 'gh.token'), 'utf8')).toBe('ghs_token1')
-  })
-
-  it('redacts token values from errors', async () => {
-    const { fetcher } = sts()
-    const { value } = store(() => new Error('rejected ghs_token1 for eyJ.identity.jwt'))
-    const error = await refreshOnce(config(), { store: () => value, logger: logger(), fetch: fetcher }, signal()).catch((caught: Error) => caught)
-    expect(String(error)).toContain('[redacted]')
-    expect(String(error)).not.toContain('ghs_token1')
-    expect(String(error)).not.toContain(IDENTITY_TOKEN)
-  })
-
-  it('fails without calling octo-sts when the identity token file is missing or empty', async () => {
-    const { fetcher, calls } = sts()
+describe('readIdentityToken', () => {
+  it('trims the file and refuses an empty or missing one', async () => {
+    await expect(readIdentityToken(join(dir, 'sa-token'))).resolves.toBe(IDENTITY_TOKEN)
     writeFileSync(join(dir, 'sa-token'), '\n')
-    await expect(refreshOnce(config(), { store: () => store().value, logger: logger(), fetch: fetcher }, signal())).rejects.toThrow('is empty')
-    rmSync(join(dir, 'sa-token'))
-    await expect(refreshOnce(config(), { store: () => store().value, logger: logger(), fetch: fetcher }, signal())).rejects.toThrow('ENOENT')
-    expect(calls).toHaveLength(0)
-  })
-
-  it('tries every workspace when one refuses', async () => {
-    const { fetcher } = sts()
-    const secrets = new Map<string, string>()
-    const value: SecretStore = { setWorkspaceSecret: (url, name, secret) => {
-      if (url === WORKSPACE) throw new Error('workspace is not registered: https://github.com/acme/widgets')
-      secrets.set(url, secret)
-      return Promise.resolve({})
-    } }
-    await expect(refreshOnce(config({ workspaces: [WORKSPACE, 'https://github.com/acme/other'] }), { store: () => value, logger: logger(), fetch: fetcher }, signal()))
-      .rejects.toThrow('workspace is not registered')
-    expect(secrets.get('https://github.com/acme/other')).toBe('ghs_token1')
+    await expect(readIdentityToken(join(dir, 'sa-token'))).rejects.toThrow('is empty')
+    await expect(readIdentityToken(join(dir, 'missing'))).rejects.toThrow('ENOENT')
   })
 })
 
 describe('writeTokenFile', () => {
-  it('replaces an existing file and leaves no temporary file behind', async () => {
+  it('creates a missing parent directory with 0700 and the file with 0600', async () => {
+    const path = join(dir, 'a', 'b', 'gh.token')
+    await writeTokenFile(path, 'secret')
+    expect(readFileSync(path, 'utf8')).toBe('secret')
+    expect(statSync(path).mode & 0o777).toBe(0o600)
+    expect(statSync(join(dir, 'a', 'b')).mode & 0o777).toBe(0o700)
+  })
+
+  it('replaces an existing file atomically and leaves no temporary file behind', async () => {
     const path = join(dir, 'gh.token')
     writeFileSync(path, 'old', { mode: 0o644 })
     await writeTokenFile(path, 'new')
     expect(readFileSync(path, 'utf8')).toBe('new')
     expect(statSync(path).mode & 0o777).toBe(0o600)
-    await expect(writeTokenFile(join(dir, 'missing', 'gh.token'), 'x')).rejects.toThrow()
+    expect(readdirSync(dir).filter(name => name.endsWith('.tmp'))).toEqual([])
+  })
+
+  it('replaces a symlink instead of writing through it', async () => {
+    const target = join(dir, 'elsewhere')
+    writeFileSync(target, 'untouched')
+    const path = join(dir, 'gh.token')
+    symlinkSync(target, path)
+    await writeTokenFile(path, 'new')
+    expect(readFileSync(target, 'utf8')).toBe('untouched')
+    expect(lstatSync(path).isSymbolicLink()).toBe(false)
+    expect(readFileSync(path, 'utf8')).toBe('new')
+  })
+
+  it('fails when the parent cannot be created', async () => {
+    writeFileSync(join(dir, 'file'), '')
+    await expect(writeTokenFile(join(dir, 'file', 'gh.token'), 'x')).rejects.toThrow()
   })
 })
 
 describe('TokenRefresher', () => {
   it('backs off 1, 2, 4 min up to 5 min', () => {
-    expect([1, 2, 3, 4, 5, 10].map(retryDelayMs)).toEqual([60_000, 120_000, 240_000, 300_000, 300_000, 300_000])
+    expect([1, 2, 3, 4, 5, 10].map(retryDelayMs)).toEqual([MIN, 2 * MIN, 4 * MIN, 5 * MIN, 5 * MIN, 5 * MIN])
   })
 
-  it('refreshes at start and on the interval', async () => {
-    vi.useFakeTimers()
-    const { fetcher, calls } = sts()
-    const { value, secrets } = store()
-    const refresher = new TokenRefresher(config(), { store: () => value, logger: logger(), fetch: fetcher, now: Date.now })
+  it('exchanges at start and on the interval, delivering to the file and every workspace', async () => {
+    const { refresher, server, secrets, log, advance } = harness({ workspaces: [WORKSPACE, OTHER] })
     refresher.start()
-    await advance(refresher, 0)
-    expect(refresher.health()).toMatchObject({ state: 'ready', failures: 0 })
-    expect(secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
-    await advance(refresher, 30 * 60_000)
-    expect(calls).toHaveLength(2)
-    expect(secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token2')
+    await advance(0)
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
+    expect(secrets.secrets.get(`${OTHER} GITHUB_TOKEN`)).toBe('ghs_token1')
+    expect(tokenFile()).toBe('ghs_token1')
+    await advance(30 * MIN - 1_000)
+    expect(server.calls).toHaveLength(1)
+    await advance(1_000)
+    expect(server.calls).toHaveLength(2)
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token2')
+    expect(log.lines.map(line => line.level)).toEqual(['info', 'info'])
     await refresher.stop()
   })
 
-  it('keeps the previous token on failure, backs off and recovers', async () => {
-    vi.useFakeTimers()
-    const failing = () => Response.json({ message: 'unavailable' }, { status: 503 })
-    const { fetcher, calls } = sts()
-    const { value, secrets } = store()
-    const log = logger()
-    const refresher = new TokenRefresher(config(), { store: () => value, logger: log, fetch: fetcher, now: Date.now })
+  it('reads the identity token file fresh for each exchange', async () => {
+    const { refresher, server, advance } = harness()
     refresher.start()
-    await advance(refresher, 0)
-    const answers = [failing, failing]
-    vi.mocked(fetcher).mockImplementation(async (url, init) => {
-      calls.push({ url: new URL(String(url)), headers: init?.headers as Record<string, string> })
-      return (answers.shift() ?? (() => Response.json({ token: 'ghs_recovered' })))()
-    })
-    await advance(refresher, 30 * 60_000)
-    expect(refresher.health()).toMatchObject({ state: 'failing', failures: 1, detail: 'octo-sts answered 503: unavailable' })
-    expect(secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
-    expect(readFileSync(join(dir, 'gh.token'), 'utf8')).toBe('ghs_token1')
-    await advance(refresher, 59_000)
-    expect(calls).toHaveLength(2)
-    await advance(refresher, 1_000)
-    expect(refresher.health()).toMatchObject({ state: 'failing', failures: 2 })
-    await advance(refresher, 120_000)
-    expect(refresher.health()).toMatchObject({ state: 'ready', failures: 0 })
-    expect(secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_recovered')
-    expect(log.warn).toHaveBeenCalledTimes(2)
-    expect(logged(log)).not.toMatch(/ghs_|eyJ/)
+    await advance(0)
+    writeFileSync(join(dir, 'sa-token'), 'eyJ.rotated.jwt')
+    await advance(30 * MIN)
+    expect(server.calls.map(call => (call.init.headers as Record<string, string>).authorization)).toEqual([`Bearer ${IDENTITY_TOKEN}`, 'Bearer eyJ.rotated.jwt'])
     await refresher.stop()
   })
 
-  it('reports expired once the last good token is past its hour', async () => {
+  it('takes the issuance time before the exchange, so a slow answer does not push the next one back', async () => {
+    const { refresher, server, advance } = harness()
+    server.answers.push(() => new Promise(resolve => setTimeout(() => resolve(Response.json({ token: 'ghs_slow' })), 2 * MIN)))
+    refresher.start()
+    await vi.waitFor(() => expect(server.calls).toHaveLength(1))
+    await vi.advanceTimersByTimeAsync(2 * MIN)
+    await refresher.settled()
+    expect(tokenFile()).toBe('ghs_slow')
+    await advance(28 * MIN)
+    expect(server.calls).toHaveLength(2)
+    await refresher.stop()
+  })
+
+  it('keeps the previous token on exchange failure, backs off and recovers', async () => {
+    const { refresher, server, secrets, log, advance } = harness()
+    refresher.start()
+    await advance(0)
+    server.answers.push(refused(), refused())
+    await advance(30 * MIN)
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
+    expect(tokenFile()).toBe('ghs_token1')
+    expect(log.lines.at(-1)).toMatchObject({ level: 'warn' })
+    expect(log.lines.at(-1)!.text).toContain('exchange failed: octo-sts answered 503: unavailable')
+    await advance(MIN - 1_000)
+    expect(server.calls).toHaveLength(2)
+    await advance(1_000)
+    expect(server.calls).toHaveLength(3)
+    await advance(2 * MIN)
+    expect(server.calls).toHaveLength(4)
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token2')
+    expect(log.lines.at(-1)!.text).toContain('after 2 failed attempts')
+    expect(JSON.stringify(log.lines)).not.toMatch(/ghs_|eyJ/)
+    await refresher.stop()
+  })
+
+  it('retries only the destination that failed, without a new exchange', async () => {
+    const { refresher, server, secrets, log, advance } = harness({ workspaces: [WORKSPACE, OTHER] })
+    secrets.failures.set(OTHER, () => new Error('broker busy'))
+    refresher.start()
+    await advance(0)
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
+    expect(log.lines.at(-1)).toMatchObject({ level: 'warn' })
+    expect(log.lines.at(-1)!.text).toContain(`${OTHER}: broker busy`)
+    const before = secrets.setWorkspaceSecret.mock.calls.length
+    secrets.failures.clear()
+    await advance(MIN)
+    expect(server.calls).toHaveLength(1)
+    expect(secrets.setWorkspaceSecret.mock.calls.slice(before).map(call => call[0])).toEqual([OTHER])
+    expect(secrets.secrets.get(`${OTHER} GITHUB_TOKEN`)).toBe('ghs_token1')
+    expect(log.lines.at(-1)).toMatchObject({ level: 'info' })
+    await advance(29 * MIN - 1_000)
+    expect(server.calls).toHaveLength(1)
+    await advance(1_000)
+    expect(server.calls).toHaveLength(2)
+    await refresher.stop()
+  })
+
+  it('does not fast-retry a workspace that is not registered, and tries it again at the next exchange', async () => {
+    const { refresher, server, secrets, log, advance } = harness({ workspaces: [WORKSPACE, OTHER] })
+    secrets.failures.set(OTHER, () => new Error(`workspace is not registered: ${OTHER}`))
+    refresher.start()
+    await advance(0)
+    expect(log.lines.at(-1)).toMatchObject({ level: 'warn' })
+    expect(log.lines.at(-1)!.text).toContain('retried at the next exchange')
+    const before = secrets.setWorkspaceSecret.mock.calls.length
+    await advance(30 * MIN - 1_000)
+    expect(secrets.setWorkspaceSecret.mock.calls.length).toBe(before)
+    expect(server.calls).toHaveLength(1)
+    secrets.failures.clear()
+    await advance(1_000)
+    expect(server.calls).toHaveLength(2)
+    expect(secrets.secrets.get(`${OTHER} GITHUB_TOKEN`)).toBe('ghs_token2')
+    await refresher.stop()
+  })
+
+  it('does not report expiry while another destination holds a fresh token', async () => {
+    const { refresher, secrets, log, advance } = harness()
+    secrets.failures.set(WORKSPACE, () => new Error(`workspace is not registered: ${WORKSPACE}`))
+    refresher.start()
+    await advance(0)
+    await advance(120 * MIN)
+    expect(log.lines.filter(line => line.level === 'error')).toEqual([])
+    expect(log.lines.filter(line => line.level === 'warn').length).toBeGreaterThanOrEqual(4)
+    await refresher.stop()
+  })
+
+  it('reports an error when no destination holds a valid token', async () => {
+    const { refresher, server, log, advance } = harness()
+    server.answers.push(refused(401, 'unable to verify bearer token'))
+    refresher.start()
+    await advance(0)
+    expect(log.lines.at(-1)).toMatchObject({ level: 'error' })
+    expect(log.lines.at(-1)!.text).toContain('no destination holds a valid token')
+    await refresher.stop()
+  })
+
+  it('reports an error once the last token is past its hour', async () => {
+    const { refresher, server, log, advance } = harness({ refreshMinutes: 45 })
+    refresher.start()
+    await advance(0)
+    for (let i = 0; i < 20; i++) server.answers.push(refused(500, 'down'))
+    await advance(45 * MIN)
+    expect(log.lines.at(-1)).toMatchObject({ level: 'warn' })
+    await advance(14 * MIN)
+    expect(log.lines.filter(line => line.level === 'error')).toEqual([])
+    await advance(5 * MIN)
+    expect(log.lines.at(-1)).toMatchObject({ level: 'error' })
+    await refresher.stop()
+  })
+
+  it('does not call octo-sts when the identity token file is empty, and redacts tokens from delivery errors', async () => {
+    const { refresher, server, secrets, log, advance } = harness()
+    writeFileSync(join(dir, 'sa-token'), '\n')
+    refresher.start()
+    await advance(0)
+    expect(server.calls).toHaveLength(0)
+    expect(log.lines.at(-1)!.text).toContain('is empty')
+    writeFileSync(join(dir, 'sa-token'), IDENTITY_TOKEN)
+    secrets.failures.set(WORKSPACE, () => new Error('rejected ghs_token1'))
+    await advance(MIN)
+    expect(log.lines.at(-1)!.text).toContain('rejected [redacted]')
+    expect(JSON.stringify(log.lines)).not.toMatch(/ghs_|eyJ/)
+    await refresher.stop()
+  })
+
+  it('treats a missing sandboxManager as a transient failure and still writes the file', async () => {
     vi.useFakeTimers()
     const { fetcher } = sts()
-    const { value } = store()
+    const secrets = store()
+    let service: SecretStore | undefined
     const log = logger()
-    const refresher = new TokenRefresher(config({ refreshMinutes: 55 }), { store: () => value, logger: log, fetch: fetcher, now: Date.now })
+    const refresher = new TokenRefresher(config(), { store: () => service, logger: log, fetch: fetcher, now: Date.now })
     refresher.start()
-    await advance(refresher, 0)
-    vi.mocked(fetcher).mockImplementation(async () => Response.json({ message: 'down' }, { status: 500 }))
-    await advance(refresher, 55 * 60_000)
-    expect(refresher.health().state).toBe('failing')
-    await advance(refresher, 5 * 60_000)
-    expect(refresher.health().state).toBe('expired')
-    expect(log.error).not.toHaveBeenCalled()
-    await advance(refresher, 2 * 60_000)
-    expect(log.error).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(0)
+    await refresher.settled()
+    expect(tokenFile()).toBe('ghs_token1')
+    expect(log.lines.at(-1)!.text).toContain('sandboxManager service is not available')
+    service = secrets.value
+    await vi.advanceTimersByTimeAsync(MIN)
+    await refresher.settled()
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
     await refresher.stop()
   })
 
@@ -252,22 +368,37 @@ describe('TokenRefresher', () => {
     process.on('unhandledRejection', listener)
     try {
       refresher.start()
-      await advance(refresher, 10 * 60_000)
-      expect(refresher.health()).toMatchObject({ state: 'expired', detail: 'fetch failed' })
+      for (let i = 0; i < 10; i++) {
+        await vi.advanceTimersByTimeAsync(MIN)
+        await refresher.settled()
+      }
+      expect(vi.mocked(fetcher).mock.calls.length).toBeGreaterThan(1)
       await refresher.stop()
-      expect(refresher.health().state).toBe('stopped')
       const before = vi.mocked(fetcher).mock.calls.length
-      await advance(refresher, 60 * 60_000)
+      await vi.advanceTimersByTimeAsync(60 * MIN)
       expect(vi.mocked(fetcher).mock.calls.length).toBe(before)
     } finally {
       process.off('unhandledRejection', listener)
     }
     expect(rejections).toEqual([])
   })
+
+  it('stops while an exchange is in flight without delivering its token', async () => {
+    const { refresher, server, secrets } = harness()
+    let release: (response: Response) => void = () => {}
+    server.answers.push(() => new Promise(resolve => { release = resolve }))
+    refresher.start()
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.waitFor(() => expect(server.calls).toHaveLength(1))
+    const stopping = refresher.stop()
+    release(Response.json({ token: 'ghs_late' }))
+    await stopping
+    expect(secrets.secrets.size).toBe(0)
+  })
 })
 
 describe('plugin', () => {
-  it('starts in an effect, looks sandboxManager up per round and stops on dispose', async () => {
+  it('starts in an effect, looks sandboxManager up when delivering and stops on dispose', async () => {
     vi.useFakeTimers()
     const { fetcher } = sts()
     vi.stubGlobal('fetch', fetcher)
@@ -280,7 +411,7 @@ describe('plugin', () => {
       expect(get).toHaveBeenCalledWith('sandboxManager')
       expect(secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
       await (dispose as unknown as () => Promise<void>)()
-      await vi.advanceTimersByTimeAsync(60 * 60_000)
+      await vi.advanceTimersByTimeAsync(60 * MIN)
       expect(vi.mocked(fetcher)).toHaveBeenCalledTimes(1)
     } finally {
       vi.unstubAllGlobals()

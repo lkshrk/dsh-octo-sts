@@ -21,4 +21,4 @@ export function apply(ctx: PluginContext, config: OctoStsConfig): void {
 
 export { OctoStsConfigSchema, type OctoStsConfig } from './config.ts'
 export { exchange } from './exchange.ts'
-export { TokenRefresher, refreshOnce, retryDelayMs, writeTokenFile, type Health, type SecretStore } from './refresher.ts'
+export { PermanentError, TokenRefresher, readIdentityToken, retryDelayMs, writeTokenFile, type SecretStore } from './refresher.ts'
