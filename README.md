@@ -59,8 +59,9 @@ The file appears after the first exchange, a few seconds after dsh starts. A wra
 - **Failures.** Nothing is ever removed: every destination keeps its last token, which stays valid until its hour is up.
   - A failed exchange is retried after 1, 2 and 4 minutes, then every 5 minutes.
   - A destination that could not be written gets the same token again on that backoff, without a new exchange. The others keep their schedule.
-  - A Workspace dsh-yawn does not know (`workspace is not registered`) is not retried until the next exchange.
+  - A Workspace dsh-yawn does not know is not retried until the next exchange. The plugin recognises it by dsh-yawn's error text `workspace is not registered`, checked against dsh-yawn 2026.11.12-1090505.
 - **Logs.** Successful exchanges log at info. A failure logs a warning naming the failed exchange or destinations while any destination still holds a valid token, and an error once none does. Token values are never logged; any that appear in an error message are replaced with `[redacted]`. The logs are the plugin's only health report.
+- **Clock and leftovers.** Scheduling uses the monotonic clock, so a wall-clock change does not trigger or delay an exchange. On start, leftover `<tokenFile>.<random>.tmp` files from an interrupted write are removed.
 - **Errors never escape.** dsh ends its process on an unhandled rejection, so every failure stays inside the loop. Disposing the plugin stops the timer, waits for a round in flight and does not deliver its token.
 
 ## Trust policy
@@ -101,7 +102,7 @@ The kubelet rotates the token file before it expires; the plugin reads it on eve
 
 - **Sandboxes can read the token.** dsh-yawn hands workspace secrets to every command in that Workspace's sandboxes as environment variables. The gain over a personal access token is the lifetime (one hour) and the scope (the policy's repositories and permissions). Keep the policy to the repositories the sandboxes work on.
 - **One hour.** GitHub installation tokens last 60 minutes and cannot be extended. If octo-sts stays unreachable for longer than that, GitHub calls fail with 401 until the next successful round.
-- **Undocumented write API.** The secret is set through dsh-yawn's `sandboxManager.setWorkspaceSecret`, a public method of its Cordis service but not a documented plugin API. It was checked against dsh-yawn 2026.11.12-1090505; check it again when upgrading dsh-yawn. The Workspace has to be registered, or the round fails with `workspace is not registered`.
+- **Undocumented write API.** The secret is set through dsh-yawn's `sandboxManager.setWorkspaceSecret`, a public method of its Cordis service but not a documented plugin API. It was checked against dsh-yawn 2026.11.12-1090505; check it again when upgrading dsh-yawn. The Workspace has to be registered; otherwise that destination fails with `workspace is not registered`.
 - **One scope and identity.** The plugin requests one token; every listed workspace gets the same one.
 
 ## Development

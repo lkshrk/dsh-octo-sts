@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
-import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
 import type { OctoStsConfig } from './config.ts'
 import { exchange } from './exchange.ts'
 
@@ -45,6 +45,14 @@ export async function writeTokenFile(path: string, token: string): Promise<void>
   }
 }
 
+export async function removeTemporaryFiles(path: string): Promise<void> {
+  const prefix = `${basename(path)}.`
+  const entries = await readdir(dirname(path)).catch(() => [] as string[])
+  for (const entry of entries) {
+    if (entry.startsWith(prefix) && /^[0-9a-f]{16}\.tmp$/.test(entry.slice(prefix.length))) await rm(join(dirname(path), entry), { force: true })
+  }
+}
+
 export async function readIdentityToken(path: string): Promise<string> {
   const token = (await readFile(path, 'utf8')).trim()
   if (!token) throw new Error(`${path} is empty`)
@@ -80,6 +88,7 @@ export class TokenRefresher {
   private running: Promise<void> | undefined
   private current: Issued | undefined
   private failures = 0
+  private started = false
 
   constructor(private readonly config: OctoStsConfig, private readonly dependencies: RefresherDependencies) {
     this.targets = destinations(config, dependencies.store)
@@ -98,7 +107,7 @@ export class TokenRefresher {
 
   private get interval(): number { return this.config.refreshMinutes * 60_000 }
 
-  private now(): number { return (this.dependencies.now ?? Date.now)() }
+  private now(): number { return this.dependencies.now ? this.dependencies.now() : performance.now() }
 
   private schedule(delay: number): void {
     if (this.controller.signal.aborted) return
@@ -107,6 +116,10 @@ export class TokenRefresher {
   }
 
   private async round(): Promise<void> {
+    if (!this.started) {
+      this.started = true
+      if (this.config.tokenFile) await removeTemporaryFiles(this.config.tokenFile).catch(() => undefined)
+    }
     const due = !this.current || this.now() >= this.current.issuedAt + this.interval
     let exchangeError: string | undefined
     if (due) {

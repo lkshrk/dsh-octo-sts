@@ -5,7 +5,7 @@ import { format } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { OctoStsConfigSchema, type OctoStsConfig } from '../src/config.ts'
 import { exchange } from '../src/exchange.ts'
-import { TokenRefresher, readIdentityToken, retryDelayMs, writeTokenFile, type SecretStore } from '../src/refresher.ts'
+import { TokenRefresher, readIdentityToken, removeTemporaryFiles, retryDelayMs, writeTokenFile, type SecretStore } from '../src/refresher.ts'
 import { apply, Config } from '../src/index.ts'
 
 const WORKSPACE = 'https://github.com/acme/widgets'
@@ -183,6 +183,16 @@ describe('writeTokenFile', () => {
   })
 })
 
+describe('removeTemporaryFiles', () => {
+  it('removes only leftover temporary files of the token file', async () => {
+    const path = join(dir, 'gh.token')
+    for (const name of ['gh.token', 'gh.token.0123456789abcdef.tmp', 'gh.token.fedcba9876543210.tmp', 'gh.token.backup', 'other.0123456789abcdef.tmp', 'gh.token.123.tmp']) writeFileSync(join(dir, name), 'x')
+    await removeTemporaryFiles(path)
+    expect(readdirSync(dir).sort()).toEqual(['gh.token', 'gh.token.123.tmp', 'gh.token.backup', 'other.0123456789abcdef.tmp', 'sa-token'])
+    await expect(removeTemporaryFiles(join(dir, 'missing', 'gh.token'))).resolves.toBeUndefined()
+  })
+})
+
 describe('TokenRefresher', () => {
   it('backs off 1, 2, 4 min up to 5 min', () => {
     expect([1, 2, 3, 4, 5, 10].map(retryDelayMs)).toEqual([MIN, 2 * MIN, 4 * MIN, 5 * MIN, 5 * MIN, 5 * MIN])
@@ -201,6 +211,33 @@ describe('TokenRefresher', () => {
     expect(server.calls).toHaveLength(2)
     expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token2')
     expect(log.lines.map(line => line.level)).toEqual(['info', 'info'])
+    await refresher.stop()
+  })
+
+  it('removes leftover temporary files before the first write', async () => {
+    const { refresher, advance } = harness()
+    writeFileSync(join(dir, 'sa-token'), IDENTITY_TOKEN)
+    const run = join(dir, 'run')
+    await writeTokenFile(join(run, 'gh.token'), 'old')
+    writeFileSync(join(run, 'gh.token.0123456789abcdef.tmp'), 'leftover')
+    refresher.start()
+    await advance(0)
+    expect(readdirSync(run)).toEqual(['gh.token'])
+    expect(tokenFile()).toBe('ghs_token1')
+    await refresher.stop()
+  })
+
+  it('schedules on the monotonic clock by default, unaffected by wall-clock jumps', async () => {
+    vi.useFakeTimers()
+    const { fetcher, calls } = sts()
+    const refresher = new TokenRefresher(config(), { store: () => undefined, logger: logger(), fetch: fetcher })
+    refresher.start()
+    await vi.waitFor(() => expect(calls).toHaveLength(1))
+    await refresher.settled()
+    vi.setSystemTime(Date.now() + 24 * 60 * MIN)
+    await vi.advanceTimersByTimeAsync(MIN)
+    await refresher.settled()
+    expect(calls).toHaveLength(1)
     await refresher.stop()
   })
 
