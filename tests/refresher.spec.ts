@@ -167,8 +167,15 @@ describe('config', () => {
       expect(issues({ owners: [{ ...acme, scope: 'ACME', workspaces: [WORKSPACE, 'https://github.com/Acme/Other.git'] }] })).toEqual([])
     })
 
+    it('checks the single-owner form\'s workspaces against its scope too', () => {
+      expect(issues({ ...base, workspaces: [WORKSPACE, GLOBEX] })).toEqual([`workspaces.1: ${GLOBEX} does not belong to acme, the owner of scope acme`])
+      expect(issues({ ...base, scope: 'acme/widgets', workspaces: [WORKSPACE, OTHER] })).toEqual([`workspaces.1: ${OTHER} is outside scope acme/widgets`])
+      expect(issues({ ...base, scope: 'Acme', workspaces: ['https://github.com/ACME/Widgets'] })).toEqual([])
+    })
+
     it('refuses the same scope and identity twice and an owner without a destination', () => {
       expect(issues({ owners: [acme, { ...acme, workspaces: [], tokenFile: '/run/second.token' }] })).toEqual(['owners.1: scope acme with identity dsh-yawn is listed twice'])
+      expect(issues({ owners: [acme, { ...acme, scope: 'ACME', identity: 'DSH-yawn', workspaces: [], tokenFile: '/run/second.token' }] })).toEqual(['owners.1: scope ACME with identity DSH-yawn is listed twice'])
       expect(issues({ owners: [{ scope: 'acme', identity: 'dsh-yawn' }] })).toEqual(['owners.0: set workspaces, tokenFile or both'])
       expect(issues({ owners: [{ ...acme, extra: true }] })).not.toEqual([])
     })
@@ -751,6 +758,27 @@ describe('TokenRefresher with several owners', () => {
     expect(read('acme')).toBe('ghs_acme2')
     expect(read('globex')).toBe('ghs_globex1')
     await refresher.stop()
+  })
+
+  it('keeps one owner on schedule while the other\'s registration hangs', async () => {
+    const { refresher, calls, secrets, log } = owners()
+    secrets.registered.add(GLOBEX)
+    secrets.createRepositoryWorkspace.mockImplementation(() => new Promise(() => undefined))
+    refresher.start()
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.waitFor(() => expect(secrets.createRepositoryWorkspace).toHaveBeenCalledWith(WORKSPACE))
+    expect(read('acme')).toBe('ghs_acme1')
+    expect(read('globex')).toBe('ghs_globex1')
+    expect(secrets.secrets.get(`${GLOBEX} GITHUB_TOKEN`)).toBe('ghs_globex1')
+    for (let elapsed = 0; elapsed < 30 * MIN; elapsed += 1_000) await vi.advanceTimersByTimeAsync(1_000)
+    await vi.waitFor(() => expect(secrets.secrets.get(`${GLOBEX} GITHUB_TOKEN`)).toBe('ghs_globex2'))
+    expect(calls.filter(scope => scope === 'globex')).toHaveLength(2)
+    expect(read('globex')).toBe('ghs_globex2')
+    expect(secrets.createRepositoryWorkspace).toHaveBeenCalledTimes(1)
+    expect(log.lines).toContainEqual({ level: 'warn', text: expect.stringContaining(`acme/dsh-yawn ${WORKSPACE}: could not register the workspace: timed out`) })
+    const stopping = refresher.stop()
+    await vi.advanceTimersByTimeAsync(5 * MIN)
+    await stopping
   })
 
   it('stops every owner on stop', async () => {

@@ -47,8 +47,6 @@ For repositories under several GitHub owners, list one entry per owner under `ow
 
 ## Configuration
 
-| Key | Default | Meaning |
-| --- | --- | --- |
 Shared by every owner:
 
 | Key | Default | Meaning |
@@ -69,10 +67,7 @@ Per owner, either at the top level or in each `owners` entry, never both:
 | `workspaces` | `[]` | https repository URLs, without credentials, of the dsh-yawn Workspaces that receive the token as a workspace secret |
 | `tokenFile` | none | Absolute path the token is also written to: created with mode 0600 under a random temporary name, then renamed over the old file. A missing parent directory is created with mode 0700 |
 
-Each owner needs at least one of `workspaces` and `tokenFile`. Unknown keys are refused, and so is a top-level `scope`, `identity`, `workspaces` or `tokenFile` next to `owners`. In `owners`, the configuration is also refused when:
-
-- a workspace is not `https://github.com/<owner>/<repository>` with `<owner>` the first part of its owner's `scope`, or the repository itself when the scope is `owner/repo` (compared case-insensitively);
-- two owners name the same token file, the same workspace, or the same scope and identity.
+Each owner needs at least one of `workspaces` and `tokenFile`. Unknown keys are refused, and so is a top-level `scope`, `identity`, `workspaces` or `tokenFile` next to `owners`. In `owners`, two owners may not name the same token file, the same workspace, or the same scope and identity (compared case-insensitively). In both forms, every workspace has to be `https://github.com/<owner>/<repository>` with `<owner>` the first part of the scope, and the repository itself when the scope is `owner/repo` (compared case-insensitively).
 
 A wrapper around `gh` can read the token file per call:
 
@@ -85,26 +80,30 @@ exec gh "$@"
 
 The file appears after the first exchange, a few seconds after dsh starts. A wrapper used at startup should wait for it.
 
-With several owners, name each token file after its owner and let the wrapper pick it from the target repository: `--repo`/`-R`, then `GH_REPO`, then the `origin` remote of the current directory. It accepts `OWNER/REPO`, `HOST/OWNER/REPO` and https or ssh remote URLs.
+With several owners, name each token file `<owner>.token` after its owner in lower case (`/run/dsh-octo-sts/acme.token`) and let a wrapper pick the file from the target repository: `--repo`/`-R` (also `-ROWNER/REPO` and `--repo=`), then `GH_REPO`, then the `origin` remote of the current directory. It accepts `OWNER/REPO`, `HOST/OWNER/REPO` and https, ssh and scp-style remote URLs. [`examples/gh-owner-token.sh`](examples/gh-owner-token.sh), installed under a name other than `gh`:
 
 ```sh
 #!/bin/sh
+tokens="${DSH_OCTO_STS_TOKENS:-/run/dsh-octo-sts}"
 repo="${GH_REPO:-}"
 previous=
 for arg in "$@"; do
   case "$previous" in -R|--repo) repo="$arg" ;; esac
-  case "$arg" in --repo=*) repo="${arg#--repo=}" ;; esac
+  case "$arg" in
+    --repo=*) repo="${arg#--repo=}" ;;
+    -R?*) repo="${arg#-R}" ;;
+  esac
   previous="$arg"
 done
 [ -n "$repo" ] || repo="$(git remote get-url origin 2>/dev/null)"
-owner="$(printf '%s\n' "$repo" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://[^/]+/##; s#^[^/@:]+@[^/:]+:##; s#^[^/]+/([^/]+/[^/]+)$#\1#; s#/.*##')"
-case "$owner" in ''|*[!A-Za-z0-9_.-]*) echo "gh: cannot tell the repository owner" >&2; exit 1 ;; esac
-GH_TOKEN="$(cat "/run/dsh-octo-sts/$owner.token")" || exit 1
+owner="$(printf '%s\n' "$repo" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://[^/]+/##; s#^[^/@:]+@[^/:]+:##; s#^[^/]+/([^/]+/[^/]+)$#\1#; s#/.*##' | tr '[:upper:]' '[:lower:]')"
+case "$owner" in ''|.*|*[!a-z0-9_.-]*) echo "gh: cannot tell the repository owner" >&2; exit 1 ;; esac
+GH_TOKEN="$(cat "$tokens/$owner.token")" || exit 1
 export GH_TOKEN
 exec gh "$@"
 ```
 
-`gh api` calls without a repository context need `GH_REPO` set.
+The wrapper picks by owner only, so use owner-wide scopes (`scope: acme`, not `acme/widgets`) when several owners share it: one token per owner has to cover every repository the wrapper may be called for. `DSH_OCTO_STS_TOKENS` overrides the token directory. `gh api` calls without a repository context need `GH_REPO` set.
 
 ## Behaviour
 
