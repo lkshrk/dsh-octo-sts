@@ -175,7 +175,8 @@ describe('config', () => {
 
     it('refuses the same scope and identity twice and an owner without a destination', () => {
       expect(issues({ owners: [acme, { ...acme, workspaces: [], tokenFile: '/run/second.token' }] })).toEqual(['owners.1: scope acme with identity dsh-yawn is listed twice'])
-      expect(issues({ owners: [acme, { ...acme, scope: 'ACME', identity: 'DSH-yawn', workspaces: [], tokenFile: '/run/second.token' }] })).toEqual(['owners.1: scope ACME with identity DSH-yawn is listed twice'])
+      expect(issues({ owners: [acme, { ...acme, scope: 'ACME', workspaces: [], tokenFile: '/run/second.token' }] })).toEqual(['owners.1: scope ACME with identity dsh-yawn is listed twice'])
+      expect(issues({ owners: [acme, { ...acme, identity: 'DSH-yawn', workspaces: [], tokenFile: '/run/second.token' }] })).toEqual([])
       expect(issues({ owners: [{ scope: 'acme', identity: 'dsh-yawn' }] })).toEqual(['owners.0: set workspaces, tokenFile or both'])
       expect(issues({ owners: [{ ...acme, extra: true }] })).not.toEqual([])
     })

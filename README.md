@@ -67,7 +67,7 @@ Per owner, either at the top level or in each `owners` entry, never both:
 | `workspaces` | `[]` | https repository URLs, without credentials, of the dsh-yawn Workspaces that receive the token as a workspace secret |
 | `tokenFile` | none | Absolute path the token is also written to: created with mode 0600 under a random temporary name, then renamed over the old file. A missing parent directory is created with mode 0700 |
 
-Each owner needs at least one of `workspaces` and `tokenFile`. Unknown keys are refused, and so is a top-level `scope`, `identity`, `workspaces` or `tokenFile` next to `owners`. In `owners`, two owners may not name the same token file, the same workspace, or the same scope and identity (compared case-insensitively). In both forms, every workspace has to be `https://github.com/<owner>/<repository>` with `<owner>` the first part of the scope, and the repository itself when the scope is `owner/repo` (compared case-insensitively).
+Each owner needs at least one of `workspaces` and `tokenFile`. Unknown keys are refused, and so is a top-level `scope`, `identity`, `workspaces` or `tokenFile` next to `owners`. In `owners`, two owners may not name the same token file or the same workspace (compared case-insensitively), or the same scope (case-insensitive) with the same identity (case-sensitive, as it names a file). In both forms, every workspace has to be `https://github.com/<owner>/<repository>` with `<owner>` the first part of the scope, and the repository itself when the scope is `owner/repo` (compared case-insensitively). **Breaking change:** the top-level form did not check this before `owners` was added; a configuration with a workspace outside its scope now fails to load.
 
 A wrapper around `gh` can read the token file per call:
 
@@ -80,7 +80,7 @@ exec gh "$@"
 
 The file appears after the first exchange, a few seconds after dsh starts. A wrapper used at startup should wait for it.
 
-With several owners, name each token file `<owner>.token` after its owner in lower case (`/run/dsh-octo-sts/acme.token`) and let a wrapper pick the file from the target repository: `--repo`/`-R` (also `-ROWNER/REPO` and `--repo=`), then `GH_REPO`, then the `origin` remote of the current directory. It accepts `OWNER/REPO`, `HOST/OWNER/REPO` and https, ssh and scp-style remote URLs. [`examples/gh-owner-token.sh`](examples/gh-owner-token.sh), installed under a name other than `gh`:
+With several owners, name each token file `<owner>.token` after its owner in lower case (`/run/dsh-octo-sts/acme.token`) and let a wrapper pick the file from the target repository: `--repo`/`-R` (also `-ROWNER/REPO` and `--repo=`), then `GH_REPO`, then the `origin` remote of the current directory. It accepts `OWNER/REPO`, `HOST/OWNER/REPO` and https, ssh and scp-style remote URLs, and refuses a host other than `github.com`. [`examples/gh-owner-token.sh`](examples/gh-owner-token.sh), installed under a name other than `gh`:
 
 ```sh
 #!/bin/sh
@@ -96,14 +96,23 @@ for arg in "$@"; do
   previous="$arg"
 done
 [ -n "$repo" ] || repo="$(git remote get-url origin 2>/dev/null)"
-owner="$(printf '%s\n' "$repo" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://[^/]+/##; s#^[^/@:]+@[^/:]+:##; s#^[^/]+/([^/]+/[^/]+)$#\1#; s#/.*##' | tr '[:upper:]' '[:lower:]')"
+case "$repo" in
+  *://*) rest="${repo#*://}"; host="${rest%%/*}"; path="${rest#"$host"}"; path="${path#/}" ;;
+  *@*:*) host="${repo%%:*}"; path="${repo#*:}" ;;
+  */*/*) host="${repo%%/*}"; path="${repo#*/}" ;;
+  *) host=github.com; path="$repo" ;;
+esac
+host="${host##*@}"
+host="$(printf '%s\n' "${host%%:*}" | tr '[:upper:]' '[:lower:]')"
+owner="$(printf '%s\n' "${path%%/*}" | tr '[:upper:]' '[:lower:]')"
+[ "$host" = github.com ] || { echo "gh: $host is not github.com" >&2; exit 1; }
 case "$owner" in ''|.*|*[!a-z0-9_.-]*) echo "gh: cannot tell the repository owner" >&2; exit 1 ;; esac
 GH_TOKEN="$(cat "$tokens/$owner.token")" || exit 1
 export GH_TOKEN
 exec gh "$@"
 ```
 
-The wrapper picks by owner only, so use owner-wide scopes (`scope: acme`, not `acme/widgets`) when several owners share it: one token per owner has to cover every repository the wrapper may be called for. `DSH_OCTO_STS_TOKENS` overrides the token directory. `gh api` calls without a repository context need `GH_REPO` set.
+The wrapper picks by owner only, so use owner-wide scopes (`scope: acme`, not `acme/widgets`) when several owners share it: one token per owner has to cover every repository the wrapper may be called for. `DSH_OCTO_STS_TOKENS` overrides the token directory. Positional repository arguments are not parsed (`gh repo view acme/x`, `gh repo clone acme/x`, PR or issue URLs, `gh api repos/acme/x/...`): the wrapper uses only `-R`/`--repo`, `GH_REPO` and the `origin` remote, so set `GH_REPO` for those calls.
 
 ## Behaviour
 
@@ -159,6 +168,7 @@ The kubelet rotates the token file before it expires; the plugin reads it on eve
 - **Sandboxes can read the token.** dsh-yawn hands workspace secrets to every command in that Workspace's sandboxes as environment variables. The gain over a personal access token is the lifetime (one hour) and the scope (the policy's repositories and permissions). Keep the policy to the repositories the sandboxes work on.
 - **One hour.** GitHub installation tokens last 60 minutes and cannot be extended. If octo-sts stays unreachable for longer than that, GitHub calls fail with 401 until the next successful round.
 - **Undocumented API.** The plugin uses dsh-yawn's `sandboxManager.createRepositoryWorkspace` and `sandboxManager.setWorkspaceSecret`, public methods of its Cordis service but not a documented plugin API. They were checked against dsh-yawn 2026.11.12-1090505; check them again when upgrading dsh-yawn.
+- **gh wrapper.** The example wrapper reads the repository only from `-R`/`--repo`, `GH_REPO` and the `origin` remote, never from positional arguments, PR or issue URLs or `gh api` paths; set `GH_REPO` for those calls. It refuses hosts other than `github.com`.
 - **One token per owner.** Every workspace of an owner gets the same token, so the owner's trust policy has to cover all of them.
 
 ## Development

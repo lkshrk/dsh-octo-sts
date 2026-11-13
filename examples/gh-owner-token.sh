@@ -11,7 +11,16 @@ for arg in "$@"; do
   previous="$arg"
 done
 [ -n "$repo" ] || repo="$(git remote get-url origin 2>/dev/null)"
-owner="$(printf '%s\n' "$repo" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://[^/]+/##; s#^[^/@:]+@[^/:]+:##; s#^[^/]+/([^/]+/[^/]+)$#\1#; s#/.*##' | tr '[:upper:]' '[:lower:]')"
+case "$repo" in
+  *://*) rest="${repo#*://}"; host="${rest%%/*}"; path="${rest#"$host"}"; path="${path#/}" ;;
+  *@*:*) host="${repo%%:*}"; path="${repo#*:}" ;;
+  */*/*) host="${repo%%/*}"; path="${repo#*/}" ;;
+  *) host=github.com; path="$repo" ;;
+esac
+host="${host##*@}"
+host="$(printf '%s\n' "${host%%:*}" | tr '[:upper:]' '[:lower:]')"
+owner="$(printf '%s\n' "${path%%/*}" | tr '[:upper:]' '[:lower:]')"
+[ "$host" = github.com ] || { echo "gh: $host is not github.com" >&2; exit 1; }
 case "$owner" in ''|.*|*[!a-z0-9_.-]*) echo "gh: cannot tell the repository owner" >&2; exit 1 ;; esac
 GH_TOKEN="$(cat "$tokens/$owner.token")" || exit 1
 export GH_TOKEN

@@ -69,7 +69,7 @@ function checkOwners(owners: Owner[], ctx: z.RefinementCtx): void {
   const tokenFiles = new Map<string, number>()
   const workspaces = new Map<string, number>()
   owners.forEach((owner, index) => {
-    const pair = `${owner.scope}\n${owner.identity}`.toLowerCase()
+    const pair = `${owner.scope.toLowerCase()}\n${owner.identity}`
     if (pairs.has(pair)) ctx.addIssue({ code: 'custom', path: ['owners', index], message: `scope ${owner.scope} with identity ${owner.identity} is listed twice` })
     pairs.add(pair)
     if (owner.tokenFile !== undefined) {

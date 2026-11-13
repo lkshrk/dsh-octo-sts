@@ -61,6 +61,14 @@ describe('gh owner wrapper', () => {
     expect(run(['pr', 'list'])).toMatchObject({ status: 1, stdout: '', stderr: 'gh: cannot tell the repository owner\n' })
   })
 
+  it('refuses a host other than github.com', () => {
+    for (const repo of ['ghe.example.com/acme/widgets', 'https://ghe.example.com/acme/widgets', 'git@ghe.example.com:acme/widgets.git']) {
+      expect(run(['pr', 'list', '-R', repo]), repo).toMatchObject({ status: 1, stdout: '', stderr: 'gh: ghe.example.com is not github.com\n' })
+    }
+    expect(run(['pr', 'view'], { origin: 'ssh://git@ghe.example.com:2222/acme/widgets' })).toMatchObject({ status: 1, stdout: '' })
+    expect(run(['pr', 'list', '-R', 'GitHub.com/acme/widgets']).stdout).toBe('ghs_acme|pr list -R GitHub.com/acme/widgets')
+  })
+
   it('is the script the README shows', () => {
     expect(readFileSync(join(import.meta.dirname, '..', 'README.md'), 'utf8')).toContain(`\`\`\`sh\n${readFileSync(WRAPPER, 'utf8')}\`\`\``)
   })
