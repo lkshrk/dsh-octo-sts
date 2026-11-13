@@ -93,6 +93,12 @@ describe('config', () => {
     expect(parsed.tokenFile).toBeUndefined()
   })
 
+  it('refuses workspace URLs with credentials', () => {
+    for (const workspace of ['https://user:pass@github.com/acme/widgets', 'https://token@github.com/acme/widgets', 'http://github.com/acme/widgets']) {
+      expect(OctoStsConfigSchema.safeParse({ ...base, workspaces: [workspace] }).success, workspace).toBe(false)
+    }
+  })
+
   it('refuses an identity that is not one path segment, relative paths and unknown keys', () => {
     for (const identity of ['a/b', '..', '.', 'a b', '']) expect(OctoStsConfigSchema.safeParse({ ...base, identity }).success).toBe(false)
     expect(OctoStsConfigSchema.safeParse({ ...base, tokenFile: 'gh.token' }).success).toBe(false)
@@ -297,6 +303,7 @@ describe('TokenRefresher', () => {
 
   it('retries only the destination that failed, without a new exchange', async () => {
     const { refresher, server, secrets, log, advance } = harness({ workspaces: [WORKSPACE, OTHER] })
+    secrets.registered.add(WORKSPACE).add(OTHER)
     secrets.failures.set(OTHER, () => new Error('broker busy'))
     refresher.start()
     await advance(0)
@@ -348,16 +355,30 @@ describe('TokenRefresher', () => {
     await refresher.stop()
   })
 
-  it('registers each workspace once before its first delivery', async () => {
+  it('registers a workspace only when dsh-yawn does not know it, then sets the secret', async () => {
     const { refresher, secrets, log, advance } = harness({ workspaces: [WORKSPACE, OTHER] })
+    secrets.registered.add(WORKSPACE)
     refresher.start()
     await advance(0)
-    expect(secrets.createRepositoryWorkspace.mock.calls.map(call => call[0])).toEqual([WORKSPACE, OTHER])
+    expect(secrets.createRepositoryWorkspace.mock.calls.map(call => call[0])).toEqual([OTHER])
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
     expect(secrets.secrets.get(`${OTHER} GITHUB_TOKEN`)).toBe('ghs_token1')
     await advance(60 * MIN)
     expect(secrets.secrets.get(`${OTHER} GITHUB_TOKEN`)).toBe('ghs_token3')
-    expect(secrets.createRepositoryWorkspace).toHaveBeenCalledTimes(2)
+    expect(secrets.createRepositoryWorkspace).toHaveBeenCalledTimes(1)
     expect(log.lines.map(line => line.level)).toEqual(['info', 'info', 'info'])
+    await refresher.stop()
+  })
+
+  it('never touches registration for an existing workspace, even when registering would fail', async () => {
+    const { refresher, secrets, log, advance } = harness()
+    secrets.registered.add(WORKSPACE)
+    secrets.breakRegistry(() => new Error('repository anchor hash collision'))
+    refresher.start()
+    await advance(0)
+    expect(secrets.createRepositoryWorkspace).not.toHaveBeenCalled()
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
+    expect(log.lines.map(line => line.level)).toEqual(['info'])
     await refresher.stop()
   })
 
@@ -373,32 +394,59 @@ describe('TokenRefresher', () => {
     await refresher.stop()
   })
 
-  it('warns and still writes the file when the workspace cannot be registered, then retries without a new exchange', async () => {
+  it('treats a missing Web profile as permanent: warns, still writes the file and retries at the next exchange', async () => {
     const { refresher, server, secrets, log, advance } = harness()
     secrets.breakRegistry(() => new Error('repository workspaces require the dsh Web profile'))
     refresher.start()
     await advance(0)
     expect(tokenFile()).toBe('ghs_token1')
-    expect(secrets.setWorkspaceSecret).not.toHaveBeenCalled()
     expect(log.lines.at(-1)).toMatchObject({ level: 'warn' })
-    expect(log.lines.at(-1)!.text).toContain(`${WORKSPACE}: could not register the workspace: repository workspaces require the dsh Web profile`)
+    expect(log.lines.at(-1)!.text).toContain(`${WORKSPACE} (retried at the next exchange): could not register the workspace: repository workspaces require the dsh Web profile`)
     secrets.breakRegistry(undefined)
-    await advance(MIN)
-    expect(server.calls).toHaveLength(1)
-    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
+    await advance(30 * MIN - 1_000)
+    expect(secrets.createRepositoryWorkspace).toHaveBeenCalledTimes(1)
+    await advance(1_000)
+    expect(server.calls).toHaveLength(2)
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token2')
     await refresher.stop()
   })
 
-  it('warns when sandboxManager cannot register workspaces', async () => {
-    vi.useFakeTimers()
-    const { fetcher } = sts()
-    const log = logger()
-    const refresher = new TokenRefresher(config(), { store: () => ({ setWorkspaceSecret: async () => ({}) }), logger: log, fetch: fetcher, now: Date.now })
+  it('treats a sandboxManager without createRepositoryWorkspace as permanent', async () => {
+    const { refresher, secrets, log, advance } = harness()
+    delete (secrets.value as { createRepositoryWorkspace?: unknown }).createRepositoryWorkspace
     refresher.start()
-    await vi.waitFor(() => expect(log.lines).toHaveLength(1))
-    expect(log.lines[0]).toMatchObject({ level: 'warn' })
-    expect(log.lines[0]!.text).toContain('sandboxManager has no createRepositoryWorkspace')
+    await advance(0)
+    expect(log.lines.at(-1)).toMatchObject({ level: 'warn' })
+    expect(log.lines.at(-1)!.text).toContain('(retried at the next exchange): could not register the workspace: sandboxManager has no createRepositoryWorkspace')
     expect(tokenFile()).toBe('ghs_token1')
+    const before = secrets.setWorkspaceSecret.mock.calls.length
+    await advance(30 * MIN - 1_000)
+    expect(secrets.setWorkspaceSecret.mock.calls.length).toBe(before)
+    await refresher.stop()
+  })
+
+  it('does not start a second registration while a slow one is still running', async () => {
+    const { refresher, secrets, log } = harness()
+    let finish: () => void = () => {}
+    secrets.createRepositoryWorkspace.mockImplementationOnce(async (url: string) => {
+      await new Promise<void>(resolve => { finish = resolve })
+      secrets.registered.add(url)
+      return ''
+    })
+    refresher.start()
+    await vi.waitFor(() => expect(secrets.createRepositoryWorkspace).toHaveBeenCalledTimes(1))
+    await vi.advanceTimersByTimeAsync(5 * MIN)
+    await refresher.settled()
+    expect(log.lines.at(-1)).toMatchObject({ level: 'warn' })
+    expect(log.lines.at(-1)!.text).toContain(`${WORKSPACE}: could not register the workspace: timed out`)
+    await vi.advanceTimersByTimeAsync(MIN)
+    await vi.waitFor(() => expect(secrets.setWorkspaceSecret).toHaveBeenCalledTimes(2))
+    expect(secrets.createRepositoryWorkspace).toHaveBeenCalledTimes(1)
+    finish()
+    await refresher.settled()
+    expect(secrets.createRepositoryWorkspace).toHaveBeenCalledTimes(1)
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
+    expect(log.lines.at(-1)).toMatchObject({ level: 'info' })
     await refresher.stop()
   })
 

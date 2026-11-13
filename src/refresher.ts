@@ -6,6 +6,7 @@ import { exchange } from './exchange.ts'
 
 export const TOKEN_LIFETIME_MS = 60 * 60_000
 export const WRITE_TIMEOUT_MS = 60_000
+export const REGISTER_TIMEOUT_MS = 5 * 60_000
 const FIRST_RETRY_MS = 60_000
 const MAX_RETRY_MS = 5 * 60_000
 
@@ -68,31 +69,35 @@ function destinations(config: OctoStsConfig, store: () => SecretStore | undefine
     const path = config.tokenFile
     result.push({ label: path, write: token => writeTokenFile(path, token) })
   }
-  const registered = new Set<string>()
+  const registering = new Map<string, Promise<unknown>>()
   const register = async (service: SecretStore, workspace: string) => {
-    if (!config.registerWorkspaces || registered.has(workspace)) return
-    if (!service.createRepositoryWorkspace) throw new Error('could not register the workspace: sandboxManager has no createRepositoryWorkspace')
-    try {
-      await withTimeout(Promise.resolve().then(() => service.createRepositoryWorkspace!(workspace)), 'timed out')
-    } catch (error) {
-      throw new Error(`could not register the workspace: ${message(error)}`)
+    if (!service.createRepositoryWorkspace) throw new PermanentError('could not register the workspace: sandboxManager has no createRepositoryWorkspace')
+    let pending = registering.get(workspace)
+    if (!pending) {
+      const created = Promise.resolve().then(() => service.createRepositoryWorkspace!(workspace))
+      pending = created.finally(() => { registering.delete(workspace) })
+      pending.catch(() => undefined)
+      registering.set(workspace, pending)
     }
-    registered.add(workspace)
+    try {
+      await withTimeout(pending, 'timed out', REGISTER_TIMEOUT_MS)
+    } catch (error) {
+      const detail = `could not register the workspace: ${message(error)}`
+      throw /require the dsh Web profile/.test(message(error)) ? new PermanentError(detail) : new Error(detail)
+    }
   }
   const set = (service: SecretStore, workspace: string, token: string) =>
-    withTimeout(Promise.resolve().then(() => service.setWorkspaceSecret(workspace, config.secretName, token)), 'timed out')
+    withTimeout(Promise.resolve().then(() => service.setWorkspaceSecret(workspace, config.secretName, token)), 'timed out', WRITE_TIMEOUT_MS)
   const unregistered = (error: unknown) => /workspace is not registered/.test(message(error))
   for (const workspace of new Set(config.workspaces)) {
     result.push({ label: workspace, write: async token => {
       const service = store()
       if (!service) throw new Error('the sandboxManager service is not available')
-      await register(service, workspace)
       try {
         await set(service, workspace, token)
       } catch (error) {
         if (!unregistered(error)) throw error
         if (!config.registerWorkspaces) throw new PermanentError(message(error))
-        registered.delete(workspace)
         await register(service, workspace)
         await set(service, workspace, token).catch((retry: unknown) => { throw unregistered(retry) ? new PermanentError(message(retry)) : retry })
       }
@@ -216,9 +221,9 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-async function withTimeout<T>(promise: Promise<T>, detail: string): Promise<T> {
+async function withTimeout<T>(promise: Promise<T>, detail: string, ms: number): Promise<T> {
   let timer: NodeJS.Timeout | undefined
-  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(detail)), WRITE_TIMEOUT_MS) })
+  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(detail)), ms) })
   try {
     return await Promise.race([promise, timeout])
   } finally {
