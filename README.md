@@ -85,6 +85,7 @@ With several owners, name each token file `<owner>.token` after its owner in low
 ```sh
 #!/bin/sh
 tokens="${DSH_OCTO_STS_TOKENS:-/run/dsh-octo-sts}"
+[ "${GH_HOST:-github.com}" = github.com ] || { echo "gh: GH_HOST $GH_HOST is not github.com" >&2; exit 1; }
 repo="${GH_REPO:-}"
 previous=
 for arg in "$@"; do

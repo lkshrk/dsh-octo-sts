@@ -66,6 +66,8 @@ describe('gh owner wrapper', () => {
       expect(run(['pr', 'list', '-R', repo]), repo).toMatchObject({ status: 1, stdout: '', stderr: 'gh: ghe.example.com is not github.com\n' })
     }
     expect(run(['pr', 'view'], { origin: 'ssh://git@ghe.example.com:2222/acme/widgets' })).toMatchObject({ status: 1, stdout: '' })
+    expect(run(['pr', 'list', '-R', 'acme/widgets'], { env: { GH_HOST: 'ghe.example.com' } })).toMatchObject({ status: 1, stdout: '', stderr: 'gh: GH_HOST ghe.example.com is not github.com\n' })
+    expect(run(['pr', 'list', '-R', 'acme/widgets'], { env: { GH_HOST: 'github.com' } }).stdout).toBe('ghs_acme|pr list -R acme/widgets')
     expect(run(['pr', 'list', '-R', 'GitHub.com/acme/widgets']).stdout).toBe('ghs_acme|pr list -R GitHub.com/acme/widgets')
   })
 
