@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { format } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { OctoStsConfigSchema, type OctoStsConfig } from '../src/config.ts'
+import { OctoStsConfigSchema, ownerSettings, type OctoStsConfig } from '../src/config.ts'
 import { exchange } from '../src/exchange.ts'
 import { TokenRefresher, readIdentityToken, removeTemporaryFiles, retryDelayMs, writeTokenFile, type SecretStore } from '../src/refresher.ts'
 import { apply, Config } from '../src/index.ts'
@@ -124,6 +124,56 @@ describe('config', () => {
     expect(OctoStsConfigSchema.safeParse({ scope: 'acme', identity: 'dsh-yawn', tokenFile: '/run/gh.token' }).success).toBe(true)
   })
 
+  describe('owners', () => {
+    const GLOBEX = 'https://github.com/globex/app'
+    const acme = { scope: 'acme', identity: 'dsh-yawn', workspaces: [WORKSPACE], tokenFile: '/run/acme.token' }
+    const globex = { scope: 'globex', identity: 'dsh-yawn', workspaces: [GLOBEX], tokenFile: '/run/globex.token' }
+    const issues = (input: Record<string, unknown>) => {
+      const result = OctoStsConfigSchema.safeParse(input)
+      return result.success ? [] : result.error.issues.map(issue => `${issue.path.join('.')}: ${issue.message}`)
+    }
+
+    it('splits into one owner per entry with the shared keys', () => {
+      const parsed = OctoStsConfigSchema.parse({ refreshMinutes: 10, secretName: 'GH', owners: [acme, { scope: 'globex', identity: 'bot', tokenFile: '/run/globex.token' }] })
+      expect(ownerSettings(parsed)).toEqual([
+        expect.objectContaining({ ...acme, refreshMinutes: 10, secretName: 'GH', sts: 'https://sts.h-cloud.io', registerWorkspaces: true }),
+        expect.objectContaining({ scope: 'globex', identity: 'bot', workspaces: [], tokenFile: '/run/globex.token', refreshMinutes: 10 }),
+      ])
+    })
+
+    it('keeps the single-owner form as one owner', () => {
+      const parsed = OctoStsConfigSchema.parse(base)
+      expect(parsed.owners).toBeUndefined()
+      expect(ownerSettings(parsed)).toEqual([expect.objectContaining({ scope: 'acme', identity: 'dsh-yawn', workspaces: [WORKSPACE], tokenFile: undefined, secretName: 'GITHUB_TOKEN' })])
+    })
+
+    it('refuses mixing owners with the single-owner keys', () => {
+      for (const key of ['scope', 'identity', 'workspaces', 'tokenFile'] as const) {
+        expect(issues({ owners: [acme], [key]: base[key as keyof typeof base] ?? '/run/gh.token' }), key).toEqual([`${key}: set ${key} inside owners, not next to it`])
+      }
+      expect(issues({ owners: [] })).not.toEqual([])
+      expect(issues({ identity: 'dsh-yawn', tokenFile: '/run/gh.token' })).toEqual(['scope: set scope and identity, or owners'])
+    })
+
+    it('refuses two owners sharing a token file', () => {
+      expect(issues({ owners: [acme, { ...globex, tokenFile: '/run/../run/acme.token' }] })).toEqual(['owners.1.tokenFile: /run/acme.token is already the tokenFile of owners[0]'])
+    })
+
+    it('refuses a workspace outside its owner', () => {
+      expect(issues({ owners: [acme, { ...globex, workspaces: [GLOBEX, OTHER] }] })).toEqual([`owners.1.workspaces.1: ${OTHER} does not belong to globex, the owner of scope globex`])
+      expect(issues({ owners: [acme, { ...acme, identity: 'other', tokenFile: undefined, workspaces: [`${WORKSPACE}/`] }] })).toEqual([`owners.1.workspaces.0: ${WORKSPACE}/ is already a workspace of owners[0]`])
+      expect(issues({ owners: [{ ...acme, workspaces: ['https://gitlab.com/acme/widgets'] }] })).toEqual(['owners.0.workspaces.0: https://gitlab.com/acme/widgets must be https://github.com/<owner>/<repository>'])
+      expect(issues({ owners: [{ ...acme, scope: 'acme/widgets', workspaces: [WORKSPACE, OTHER] }] })).toEqual([`owners.0.workspaces.1: ${OTHER} is outside scope acme/widgets`])
+      expect(issues({ owners: [{ ...acme, scope: 'ACME', workspaces: [WORKSPACE, 'https://github.com/Acme/Other.git'] }] })).toEqual([])
+    })
+
+    it('refuses the same scope and identity twice and an owner without a destination', () => {
+      expect(issues({ owners: [acme, { ...acme, workspaces: [], tokenFile: '/run/second.token' }] })).toEqual(['owners.1: scope acme with identity dsh-yawn is listed twice'])
+      expect(issues({ owners: [{ scope: 'acme', identity: 'dsh-yawn' }] })).toEqual(['owners.0: set workspaces, tokenFile or both'])
+      expect(issues({ owners: [{ ...acme, extra: true }] })).not.toEqual([])
+    })
+  })
+
   it('is a standard schema Cordis can validate', () => {
     expect(typeof Config['~standard'].validate).toBe('function')
   })
@@ -131,10 +181,11 @@ describe('config', () => {
 
 describe('exchange', () => {
   const signal = () => new AbortController().signal
+  const request = { sts: 'https://sts.example.test', scope: 'acme', identity: 'dsh-yawn' }
 
   it('sends the identity token as a bearer with scope and identity and refuses redirects', async () => {
     const { fetcher, calls } = sts()
-    await expect(exchange(config(), IDENTITY_TOKEN, fetcher, signal())).resolves.toBe('ghs_token1')
+    await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).resolves.toBe('ghs_token1')
     expect(calls[0]!.url.toString()).toBe('https://sts.example.test/sts/exchange?scope=acme&identity=dsh-yawn')
     expect((calls[0]!.init.headers as Record<string, string>).authorization).toBe(`Bearer ${IDENTITY_TOKEN}`)
     expect(calls[0]!.init.redirect).toBe('error')
@@ -143,14 +194,14 @@ describe('exchange', () => {
   it('reports the status and octo-sts message on refusal', async () => {
     const { fetcher, answers } = sts()
     answers.push(refused(401, 'unable to verify bearer token'))
-    await expect(exchange(config(), IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('octo-sts answered 401: unable to verify bearer token')
+    await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('octo-sts answered 401: unable to verify bearer token')
   })
 
   it('refuses an answer without a token', async () => {
     const { fetcher, answers } = sts()
     answers.push(() => Response.json({ token: '' }), () => new Response('not json'))
-    await expect(exchange(config(), IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('without a token')
-    await expect(exchange(config(), IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('without a token')
+    await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('without a token')
+    await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('without a token')
   })
 })
 
@@ -619,6 +670,96 @@ describe('TokenRefresher', () => {
     expect(log.lines.at(-1)!.text).toContain('bad header Bearer [redacted]')
     expect(JSON.stringify(log.lines)).not.toContain(IDENTITY_TOKEN)
     await refresher.stop()
+  })
+})
+
+describe('TokenRefresher with several owners', () => {
+  const GLOBEX = 'https://github.com/globex/app'
+  const ownersConfig = () => OctoStsConfigSchema.parse({
+    sts: 'https://sts.example.test', identityTokenFile: join(dir, 'sa-token'), refreshMinutes: 30,
+    owners: [
+      { scope: 'acme', identity: 'dsh-yawn', workspaces: [WORKSPACE], tokenFile: join(dir, 'run', 'acme.token') },
+      { scope: 'globex', identity: 'dsh-yawn', workspaces: [GLOBEX], tokenFile: join(dir, 'run', 'globex.token') },
+    ],
+  })
+  const read = (owner: string) => readFileSync(join(dir, 'run', `${owner}.token`), 'utf8')
+
+  function owners() {
+    vi.useFakeTimers()
+    const issued = new Map<string, number>()
+    const refusing = new Set<string>()
+    const calls: string[] = []
+    const fetcher = vi.fn(async (url: string | URL | Request) => {
+      const scope = new URL(String(url)).searchParams.get('scope')!
+      calls.push(scope)
+      if (refusing.has(scope)) return Response.json({ message: `${scope} refused` }, { status: 403 })
+      const count = (issued.get(scope) ?? 0) + 1
+      issued.set(scope, count)
+      return Response.json({ token: `ghs_${scope}${count}` })
+    }) as unknown as typeof fetch
+    const secrets = store()
+    const log = logger()
+    const refresher = new TokenRefresher(ownersConfig(), { store: () => secrets.value, logger: log, fetch: fetcher, now: Date.now })
+    const advance = async (ms: number) => {
+      for (let left = ms; ; left -= 1_000) {
+        await vi.advanceTimersByTimeAsync(Math.min(left, 1_000))
+        await refresher.settled()
+        if (left <= 1_000) return
+      }
+    }
+    return { refresher, calls, refusing, secrets, log, advance }
+  }
+
+  it('exchanges per owner and delivers each token only to that owner\'s destinations', async () => {
+    const { refresher, calls, secrets, advance } = owners()
+    refresher.start()
+    await advance(0)
+    expect(calls.toSorted()).toEqual(['acme', 'globex'])
+    expect(read('acme')).toBe('ghs_acme1')
+    expect(read('globex')).toBe('ghs_globex1')
+    expect(statSync(join(dir, 'run', 'globex.token')).mode & 0o777).toBe(0o600)
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_acme1')
+    expect(secrets.secrets.get(`${GLOBEX} GITHUB_TOKEN`)).toBe('ghs_globex1')
+    await advance(30 * MIN)
+    expect(read('acme')).toBe('ghs_acme2')
+    expect(read('globex')).toBe('ghs_globex2')
+    await refresher.stop()
+  })
+
+  it('keeps refreshing one owner while the other\'s exchange fails, each on its own schedule', async () => {
+    const { refresher, calls, refusing, secrets, log, advance } = owners()
+    refusing.add('globex')
+    refresher.start()
+    await advance(0)
+    expect(read('acme')).toBe('ghs_acme1')
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_acme1')
+    expect(secrets.secrets.has(`${GLOBEX} GITHUB_TOKEN`)).toBe(false)
+    expect(() => read('globex')).toThrow()
+    expect(log.lines).toContainEqual({ level: 'info', text: expect.stringContaining('acme/dsh-yawn token delivered') })
+    expect(log.lines).toContainEqual({ level: 'error', text: expect.stringContaining('globex/dsh-yawn exchange failed: octo-sts answered 403: globex refused') })
+    await advance(MIN + 2 * MIN + 4 * MIN)
+    expect(calls.filter(scope => scope === 'globex')).toHaveLength(4)
+    expect(calls.filter(scope => scope === 'acme')).toHaveLength(1)
+    refusing.clear()
+    await advance(5 * MIN)
+    expect(read('globex')).toBe('ghs_globex1')
+    expect(secrets.secrets.get(`${GLOBEX} GITHUB_TOKEN`)).toBe('ghs_globex1')
+    await advance(30 * MIN - 12 * MIN - 1_000)
+    expect(calls.filter(scope => scope === 'acme')).toHaveLength(1)
+    await advance(1_000)
+    expect(calls.filter(scope => scope === 'acme')).toHaveLength(2)
+    expect(read('acme')).toBe('ghs_acme2')
+    expect(read('globex')).toBe('ghs_globex1')
+    await refresher.stop()
+  })
+
+  it('stops every owner on stop', async () => {
+    const { refresher, calls, advance } = owners()
+    refresher.start()
+    await advance(0)
+    await refresher.stop()
+    await advance(60 * MIN)
+    expect(calls).toHaveLength(2)
   })
 })
 

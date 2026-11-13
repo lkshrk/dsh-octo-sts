@@ -19,6 +19,6 @@ export function apply(ctx: PluginContext, config: OctoStsConfig): void {
   }, 'octo-sts: token refresh')
 }
 
-export { OctoStsConfigSchema, type OctoStsConfig } from './config.ts'
+export { OctoStsConfigSchema, ownerSettings, type OctoStsConfig, type OwnerSettings } from './config.ts'
 export { exchange } from './exchange.ts'
 export { PermanentError, TokenRefresher, readIdentityToken, removeTemporaryFiles, retryDelayMs, writeTokenFile, type SecretStore } from './refresher.ts'

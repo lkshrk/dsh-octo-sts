@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
-import type { OctoStsConfig } from './config.ts'
+import { ownerSettings, type OctoStsConfig, type OwnerSettings } from './config.ts'
 import { exchange } from './exchange.ts'
 
 export const TOKEN_LIFETIME_MS = 60 * 60_000
@@ -63,13 +63,14 @@ export async function readIdentityToken(path: string): Promise<string> {
   return token
 }
 
-function destinations(config: OctoStsConfig, store: () => SecretStore | undefined): Destination[] {
+type Registrations = Map<string, Promise<unknown>>
+
+function destinations(config: OwnerSettings, store: () => SecretStore | undefined, registering: Registrations): Destination[] {
   const result: Destination[] = []
   if (config.tokenFile) {
     const path = config.tokenFile
     result.push({ label: path, write: token => writeTokenFile(path, token) })
   }
-  const registering = new Map<string, Promise<unknown>>()
   const register = async (service: SecretStore, workspace: string) => {
     if (!service.createRepositoryWorkspace) throw new PermanentError('could not register the workspace: sandboxManager has no createRepositoryWorkspace')
     let pending = registering.get(workspace)
@@ -107,6 +108,21 @@ function destinations(config: OctoStsConfig, store: () => SecretStore | undefine
 }
 
 export class TokenRefresher {
+  private readonly owners: OwnerRefresher[]
+
+  constructor(config: OctoStsConfig, dependencies: RefresherDependencies) {
+    const registering: Registrations = new Map()
+    this.owners = ownerSettings(config).map(owner => new OwnerRefresher(owner, dependencies, registering))
+  }
+
+  start(): void { for (const owner of this.owners) owner.start() }
+
+  async settled(): Promise<void> { await Promise.all(this.owners.map(owner => owner.settled())) }
+
+  async stop(): Promise<void> { await Promise.all(this.owners.map(owner => owner.stop())) }
+}
+
+class OwnerRefresher {
   private readonly controller = new AbortController()
   private readonly targets: Destination[]
   private readonly deliveries = new Map<string, Delivery>()
@@ -116,8 +132,8 @@ export class TokenRefresher {
   private failures = 0
   private started = false
 
-  constructor(private readonly config: OctoStsConfig, private readonly dependencies: RefresherDependencies) {
-    this.targets = destinations(config, dependencies.store)
+  constructor(private readonly config: OwnerSettings, private readonly dependencies: RefresherDependencies, registering: Registrations) {
+    this.targets = destinations(config, dependencies.store, registering)
   }
 
   start(): void { this.schedule(0) }
