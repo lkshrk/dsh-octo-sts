@@ -9,7 +9,10 @@ export const WRITE_TIMEOUT_MS = 60_000
 const FIRST_RETRY_MS = 60_000
 const MAX_RETRY_MS = 5 * 60_000
 
-export interface SecretStore { setWorkspaceSecret(repositoryUrl: string, name: string, value: string): Promise<unknown> }
+export interface SecretStore {
+  setWorkspaceSecret(repositoryUrl: string, name: string, value: string): Promise<unknown>
+  createRepositoryWorkspace?(repositoryUrl: string): Promise<unknown>
+}
 export interface Logger { info(format: string, ...args: unknown[]): void; warn(format: string, ...args: unknown[]): void; error(format: string, ...args: unknown[]): void }
 export interface RefresherDependencies {
   store(): SecretStore | undefined
@@ -65,15 +68,33 @@ function destinations(config: OctoStsConfig, store: () => SecretStore | undefine
     const path = config.tokenFile
     result.push({ label: path, write: token => writeTokenFile(path, token) })
   }
+  const registered = new Set<string>()
+  const register = async (service: SecretStore, workspace: string) => {
+    if (!config.registerWorkspaces || registered.has(workspace)) return
+    if (!service.createRepositoryWorkspace) throw new Error('could not register the workspace: sandboxManager has no createRepositoryWorkspace')
+    try {
+      await withTimeout(Promise.resolve().then(() => service.createRepositoryWorkspace!(workspace)), 'timed out')
+    } catch (error) {
+      throw new Error(`could not register the workspace: ${message(error)}`)
+    }
+    registered.add(workspace)
+  }
+  const set = (service: SecretStore, workspace: string, token: string) =>
+    withTimeout(Promise.resolve().then(() => service.setWorkspaceSecret(workspace, config.secretName, token)), 'timed out')
+  const unregistered = (error: unknown) => /workspace is not registered/.test(message(error))
   for (const workspace of new Set(config.workspaces)) {
     result.push({ label: workspace, write: async token => {
       const service = store()
       if (!service) throw new Error('the sandboxManager service is not available')
+      await register(service, workspace)
       try {
-        await withTimeout(Promise.resolve().then(() => service.setWorkspaceSecret(workspace, config.secretName, token)), 'timed out')
+        await set(service, workspace, token)
       } catch (error) {
-        if (/workspace is not registered/.test(message(error))) throw new PermanentError(message(error))
-        throw error
+        if (!unregistered(error)) throw error
+        if (!config.registerWorkspaces) throw new PermanentError(message(error))
+        registered.delete(workspace)
+        await register(service, workspace)
+        await set(service, workspace, token).catch((retry: unknown) => { throw unregistered(retry) ? new PermanentError(message(retry)) : retry })
       }
     } })
   }

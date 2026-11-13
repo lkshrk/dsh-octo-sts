@@ -34,7 +34,8 @@ It runs in the control-plane process only, never in sandboxes.
 | `identity` | required | Trust policy name: octo-sts reads `.github/chainguard/<identity>.sts.yaml` in the scope's policy repository |
 | `identityTokenFile` | `/var/run/secrets/octo-sts/token` | The projected service account token, read fresh on every exchange |
 | `refreshMinutes` | `30` | Exchange interval, 5 to 45 minutes, counted from the moment each exchange starts |
-| `workspaces` | `[]` | Repository URLs of registered dsh-yawn Workspaces that receive the token as a workspace secret |
+| `workspaces` | `[]` | Repository URLs of the dsh-yawn Workspaces that receive the token as a workspace secret |
+| `registerWorkspaces` | `true` | Register each listed Workspace in dsh-yawn before its first delivery |
 | `secretName` | `GITHUB_TOKEN` | Name of that workspace secret |
 | `tokenFile` | none | Absolute path the token is also written to: created with mode 0600 under a random temporary name, then renamed over the old file. A missing parent directory is created with mode 0700 |
 
@@ -55,11 +56,12 @@ The file appears after the first exchange, a few seconds after dsh starts. A wra
 
 - **Exchange.** The first exchange runs as soon as the plugin starts, then every `refreshMinutes`. Each one reads the identity token file and calls `GET <sts>/sts/exchange?scope=<scope>&identity=<identity>` with `Authorization: Bearer <identity token>`.
 - **Destinations.** The token file and each workspace are separate destinations. A new token goes to every destination; a destination that already holds the current token is not written again.
+- **Workspace registration.** dsh-yawn only stores secrets for Workspaces it has registered. With `registerWorkspaces` on, the plugin registers each listed Workspace itself, so the list in its configuration is all that is needed and stays in Git. It calls `sandboxManager.createRepositoryWorkspace`, the same call the Web UI makes when a repository is opened. Repeating it for a registered repository reuses the existing Workspace. The plugin registers each Workspace once per start, before its first delivery, and again at once if dsh-yawn later answers `workspace is not registered`. A registration failure, for example `repository workspaces require the dsh Web profile`, is a warning for that Workspace: the other destinations still get the token, and registration is retried on the delivery backoff without a new exchange.
 - **Delivery to sandboxes.** dsh-yawn re-reads its secret store before every sandbox command, so running and new sandboxes get the new token at their next command without a restart. A single command that runs past the token's expiry keeps the old value.
 - **Failures.** Nothing is ever removed: every destination keeps its last token, which stays valid until its hour is up.
   - A failed exchange is retried after 1, 2 and 4 minutes, then every 5 minutes.
   - A destination that could not be written gets the same token again on that backoff, without a new exchange. The others keep their schedule.
-  - A Workspace dsh-yawn does not know is not retried until the next exchange. The plugin recognises it by dsh-yawn's error text `workspace is not registered`, checked against dsh-yawn 2026.11.12-1090505.
+  - With `registerWorkspaces` off, a Workspace dsh-yawn does not know is not retried until the next exchange. The plugin recognises it by dsh-yawn's error text `workspace is not registered`, checked against dsh-yawn 2026.11.12-1090505.
 - **Logs.** Successful exchanges log at info. A failure logs a warning naming the failed exchange or destinations while any destination still holds a valid token, and an error once none does. Token values are never logged; any that appear in an error message are replaced with `[redacted]`. The logs are the plugin's only health report.
 - **Clock and leftovers.** Scheduling uses the monotonic clock, so a wall-clock change does not trigger or delay an exchange. On start, leftover `<tokenFile>.<random>.tmp` files from an interrupted write are removed.
 - **Errors never escape.** dsh ends its process on an unhandled rejection, so every failure stays inside the loop. Disposing the plugin stops the timer, waits for a round in flight and does not deliver its token.
@@ -102,7 +104,7 @@ The kubelet rotates the token file before it expires; the plugin reads it on eve
 
 - **Sandboxes can read the token.** dsh-yawn hands workspace secrets to every command in that Workspace's sandboxes as environment variables. The gain over a personal access token is the lifetime (one hour) and the scope (the policy's repositories and permissions). Keep the policy to the repositories the sandboxes work on.
 - **One hour.** GitHub installation tokens last 60 minutes and cannot be extended. If octo-sts stays unreachable for longer than that, GitHub calls fail with 401 until the next successful round.
-- **Undocumented write API.** The secret is set through dsh-yawn's `sandboxManager.setWorkspaceSecret`, a public method of its Cordis service but not a documented plugin API. It was checked against dsh-yawn 2026.11.12-1090505; check it again when upgrading dsh-yawn. The Workspace has to be registered; otherwise that destination fails with `workspace is not registered`.
+- **Undocumented API.** The plugin uses dsh-yawn's `sandboxManager.createRepositoryWorkspace` and `sandboxManager.setWorkspaceSecret`, public methods of its Cordis service but not a documented plugin API. They were checked against dsh-yawn 2026.11.12-1090505; check them again when upgrading dsh-yawn.
 - **One scope and identity.** The plugin requests one token; every listed workspace gets the same one.
 
 ## Development

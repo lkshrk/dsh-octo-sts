@@ -16,6 +16,7 @@ export const OctoStsConfigSchema = z.object({
   identityTokenFile: absolutePath.default('/var/run/secrets/octo-sts/token'),
   refreshMinutes: z.number().int().min(5).max(45).default(30),
   workspaces: z.array(z.url({ protocol: /^https$/ })).default([]),
+  registerWorkspaces: z.boolean().default(true),
   secretName: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'must be an environment variable name').default('GITHUB_TOKEN'),
   tokenFile: absolutePath.optional(),
 }).strict().refine(config => config.workspaces.length > 0 || config.tokenFile !== undefined, 'set workspaces, tokenFile or both')
