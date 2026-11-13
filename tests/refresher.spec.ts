@@ -395,6 +395,71 @@ describe('TokenRefresher', () => {
     await stopping
     expect(secrets.secrets.size).toBe(0)
   })
+
+  it('gives up on an exchange that does not answer within 30 s and retries', async () => {
+    const { refresher, server, secrets, log, advance } = harness()
+    server.answers.push((() => {
+      const init = server.calls.at(-1)!.init
+      return new Promise<Response>((_, reject) => init.signal!.addEventListener('abort', () => reject(init.signal!.reason)))
+    }) as Answer)
+    refresher.start()
+    await vi.waitFor(() => expect(server.calls).toHaveLength(1))
+    await vi.advanceTimersByTimeAsync(30_000)
+    await refresher.settled()
+    expect(server.calls[0]!.init.signal!.aborted).toBe(true)
+    expect(log.lines.at(-1)).toMatchObject({ level: 'error' })
+    expect(log.lines.at(-1)!.text).toContain('octo-sts did not answer within 30 s')
+    await advance(MIN)
+    expect(server.calls).toHaveLength(2)
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
+    await refresher.stop()
+  })
+
+  it('gives up on a workspace write that does not finish within 60 s and retries only that write', async () => {
+    const { refresher, server, secrets, log, advance } = harness()
+    let hang = true
+    secrets.setWorkspaceSecret.mockImplementation(async (url: string, name: string, secret: string) => {
+      if (hang) return await new Promise(() => {})
+      secrets.secrets.set(`${url} ${name}`, secret)
+      return {}
+    })
+    refresher.start()
+    await vi.waitFor(() => expect(secrets.setWorkspaceSecret).toHaveBeenCalledTimes(1))
+    await vi.advanceTimersByTimeAsync(60_000)
+    await refresher.settled()
+    expect(log.lines.at(-1)).toMatchObject({ level: 'warn' })
+    expect(log.lines.at(-1)!.text).toContain(`${WORKSPACE}: timed out`)
+    expect(tokenFile()).toBe('ghs_token1')
+    hang = false
+    await advance(MIN)
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
+    expect(server.calls).toHaveLength(1)
+    await refresher.stop()
+  })
+
+  it('aborts the exchange in flight on stop', async () => {
+    const { refresher, server, secrets, log } = harness()
+    vi.mocked(server.fetcher).mockImplementation(async (url, init) => {
+      server.calls.push({ url: new URL(String(url)), init: init! })
+      return await new Promise<Response>((_, reject) => init!.signal!.addEventListener('abort', () => reject(new Error('aborted'))))
+    })
+    refresher.start()
+    await vi.waitFor(() => expect(server.calls).toHaveLength(1))
+    await refresher.stop()
+    expect(server.calls[0]!.init.signal!.aborted).toBe(true)
+    expect(secrets.secrets.size).toBe(0)
+    expect(log.lines).toEqual([])
+  })
+
+  it('redacts the identity token from an exchange error in the log', async () => {
+    const { refresher, server, log, advance } = harness()
+    vi.mocked(server.fetcher).mockImplementation(async () => { throw new TypeError(`bad header Bearer ${IDENTITY_TOKEN}`) })
+    refresher.start()
+    await advance(0)
+    expect(log.lines.at(-1)!.text).toContain('bad header Bearer [redacted]')
+    expect(JSON.stringify(log.lines)).not.toContain(IDENTITY_TOKEN)
+    await refresher.stop()
+  })
 })
 
 describe('plugin', () => {

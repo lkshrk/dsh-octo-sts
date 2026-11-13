@@ -11,15 +11,24 @@ export async function exchange(request: ExchangeRequest, identityToken: string, 
   const url = new URL('/sts/exchange', request.sts)
   url.searchParams.set('scope', request.scope)
   url.searchParams.set('identity', request.identity)
-  const response = await fetcher(url, {
-    redirect: 'error',
-    headers: { authorization: `Bearer ${identityToken}`, accept: 'application/json' },
-    signal: AbortSignal.any([signal, AbortSignal.timeout(EXCHANGE_TIMEOUT_MS)]),
-  })
-  if (!response.ok) throw new Error(`octo-sts answered ${response.status}: ${await reason(response)}`)
-  const parsed = TokenSchema.safeParse(await response.json().catch(() => undefined))
-  if (!parsed.success) throw new Error('octo-sts answered without a token')
-  return parsed.data.token
+  const timeout = new AbortController()
+  const timer = setTimeout(() => timeout.abort(new Error(`octo-sts did not answer within ${EXCHANGE_TIMEOUT_MS / 1000} s`)), EXCHANGE_TIMEOUT_MS)
+  try {
+    const response = await fetcher(url, {
+      redirect: 'error',
+      headers: { authorization: `Bearer ${identityToken}`, accept: 'application/json' },
+      signal: AbortSignal.any([signal, timeout.signal]),
+    })
+    if (!response.ok) throw new Error(`octo-sts answered ${response.status}: ${await reason(response)}`)
+    const parsed = TokenSchema.safeParse(await response.json().catch(() => undefined))
+    if (!parsed.success) throw new Error('octo-sts answered without a token')
+    return parsed.data.token
+  } catch (error) {
+    if (timeout.signal.aborted && !signal.aborted) throw timeout.signal.reason
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 async function reason(response: Response): Promise<string> {
