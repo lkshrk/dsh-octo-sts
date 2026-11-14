@@ -834,7 +834,67 @@ describe('TokenRefresher', () => {
     await refresher.settled()
     expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
     expect(server.calls).toHaveLength(1)
-    expect(log.lines).toEqual([{ level: 'info', text: 'dsh-octo-sts: acme/dsh-yawn token delivered to every destination; next exchange in 30 min' }])
+    expect(log.lines).toEqual([
+      { level: 'info', text: 'dsh-octo-sts: acme/dsh-yawn token delivered to every destination; next exchange in 30 min' },
+      { level: 'info', text: `dsh-octo-sts: acme/dsh-yawn token delivered again to ${WORKSPACE}, which had lost it` },
+    ])
+    await refresher.stop()
+  })
+
+  it('does not deliver again when cordis hands out a new proxy of the same sandboxManager on every lookup', async () => {
+    vi.useFakeTimers()
+    const server = sts()
+    const secrets = store({ registered: [WORKSPACE] })
+    const original = Symbol.for('cordis.original')
+    const lookup = () => new Proxy(secrets.value, { get: (target, prop, receiver) => prop === original ? target : Reflect.get(target, prop, receiver) })
+    const refresher = new TokenRefresher(config(), { store: lookup, logger: logger(), fetch: server.fetcher, now: Date.now })
+    refresher.start()
+    for (let i = 0; i < 10; i++) {
+      await vi.advanceTimersByTimeAsync(MIN)
+      await refresher.settled()
+    }
+    expect(secrets.setWorkspaceSecret).toHaveBeenCalledTimes(1)
+    await refresher.stop()
+  })
+
+  it('keeps counting a destination as holding its token while delivering it again fails', async () => {
+    vi.useFakeTimers()
+    const server = sts()
+    const secrets = store({ registered: [WORKSPACE] })
+    let service: SecretStore | undefined = secrets.value
+    const log = logger()
+    const refresher = new TokenRefresher(config({ tokenFile: undefined }), { store: () => service, logger: log, fetch: server.fetcher, now: Date.now })
+    refresher.start()
+    await vi.advanceTimersByTimeAsync(0)
+    await refresher.settled()
+    service = undefined
+    await vi.advanceTimersByTimeAsync(MIN)
+    await refresher.settled()
+    expect(log.lines.at(-1)).toMatchObject({ level: 'warn', text: expect.stringContaining(`${WORKSPACE}: the sandboxManager service is not available; destinations keep their last token until it expires`) })
+    service = store({ registered: [WORKSPACE] }).value
+    await vi.advanceTimersByTimeAsync(MIN)
+    await refresher.settled()
+    expect(log.lines.at(-1)).toMatchObject({ level: 'info', text: expect.stringContaining('after 1 failed attempts') })
+    expect(server.calls).toHaveLength(1)
+    await refresher.stop()
+  })
+
+  it('still repairs a lost token file while octo-sts refuses the exchange', async () => {
+    const { refresher, server, secrets, advance } = harness()
+    secrets.registered.add(WORKSPACE)
+    refresher.start()
+    await advance(0)
+    server.answers.push(refused(403, 'identity not allowed'))
+    await advance(30 * MIN)
+    expect(server.calls).toHaveLength(2)
+    rmSync(join(dir, 'run', 'gh.token'))
+    await advance(MIN)
+    expect(tokenFile()).toBe('ghs_token1')
+    expect(server.calls).toHaveLength(2)
+    await advance(29 * MIN - 1_000)
+    expect(server.calls).toHaveLength(2)
+    await advance(1_000)
+    expect(server.calls).toHaveLength(3)
     await refresher.stop()
   })
 
@@ -848,7 +908,8 @@ describe('TokenRefresher', () => {
     expect(tokenFile()).toBe('ghs_token1')
     expect(server.calls).toHaveLength(1)
     expect(secrets.setWorkspaceSecret).toHaveBeenCalledTimes(1)
-    expect(log.lines.map(line => line.level)).toEqual(['info'])
+    expect(log.lines.at(-1)).toEqual({ level: 'info', text: `dsh-octo-sts: acme/dsh-yawn token delivered again to ${join(dir, 'run', 'gh.token')}, which had lost it` })
+    expect(log.lines).toHaveLength(2)
     await refresher.stop()
   })
 

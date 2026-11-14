@@ -67,6 +67,10 @@ export async function readIdentityToken(path: string): Promise<string> {
 
 type Registrations = Map<string, Promise<unknown>>
 
+const CORDIS_ORIGINAL = Symbol.for('cordis.original')
+// cordis wraps a service in a new proxy on every ctx.get, so compare the instance behind it.
+const serviceIdentity = (service: SecretStore | undefined): unknown => (service as { [CORDIS_ORIGINAL]?: unknown } | undefined)?.[CORDIS_ORIGINAL] ?? service
+
 function destinations(config: OwnerSettings, store: () => SecretStore | undefined, registering: Registrations): Destination[] {
   const result: Destination[] = []
   if (config.tokenFile) {
@@ -98,17 +102,17 @@ function destinations(config: OwnerSettings, store: () => SecretStore | undefine
       if (!service) throw new Error('the sandboxManager service is not available')
       try {
         await set(service, workspace, token, signal)
-        return service
+        return serviceIdentity(service)
       } catch (error) {
         if (!unregistered(error)) throw error
         if (!config.registerWorkspaces) throw new PermanentError(message(error))
         await register(service, workspace, signal)
         await set(service, workspace, token, signal).catch((retry: unknown) => { throw unregistered(retry) ? new PermanentError(message(retry)) : retry })
-        return service
+        return serviceIdentity(service)
       }
     }, holds: async marker => {
       try {
-        return store() === marker
+        return serviceIdentity(store()) === marker
       } catch {
         return false
       }
@@ -139,6 +143,8 @@ class OwnerRefresher {
   private timer: NodeJS.Timeout | undefined
   private running: Promise<void> | undefined
   private current: Issued | undefined
+  private exchangeAt = -Infinity
+  private exchangeFailure: ExchangeFailure | undefined
   private failures = 0
   private repeated: string | undefined
   private started = false
@@ -173,29 +179,34 @@ class OwnerRefresher {
       this.started = true
       if (this.config.tokenFile) await removeTemporaryFiles(this.config.tokenFile).catch(() => undefined)
     }
-    const due = !this.current || this.now() >= this.current.issuedAt + this.interval
-    let exchangeError: ExchangeFailure | undefined
+    const due = this.now() >= this.exchangeAt
     if (due) {
       const issuedAt = this.now()
       let identityToken: string | undefined
       try {
         identityToken = await readIdentityToken(this.config.identityTokenFile)
         this.current = { token: await exchange(this.config, identityToken, this.dependencies.fetch ?? fetch, this.controller.signal), issuedAt }
+        this.exchangeAt = issuedAt + this.interval
+        this.exchangeFailure = undefined
       } catch (error) {
         const refused = error instanceof ExchangeRefused ? error : undefined
-        exchangeError = { text: redact(message(error), [identityToken]), permanent: refused?.permanent ?? false, retryAfterMs: refused?.retryAfterMs }
+        this.exchangeFailure = { text: redact(message(error), [identityToken]), permanent: refused?.permanent ?? false, retryAfterMs: refused?.retryAfterMs }
+        if (this.exchangeFailure.permanent) this.exchangeAt = this.now() + this.interval
       }
     }
     if (this.controller.signal.aborted) return
-    const fresh = due && exchangeError === undefined
+    const fresh = due && this.exchangeFailure === undefined
     const current = this.current
     let attempted = false
     if (current) {
       const results = await Promise.allSettled(this.targets.map(target => this.deliver(target, current, fresh)))
       if (this.controller.signal.aborted) return
-      attempted = results.some(result => result.status === 'fulfilled' && result.value)
+      const outcomes = results.map(result => result.status === 'fulfilled' ? result.value : undefined)
+      attempted = outcomes.some(outcome => outcome !== undefined)
+      const again = this.targets.filter((_, index) => outcomes[index] === 'redelivered').map(target => target.label)
+      if (again.length > 0) this.log('info', 'dsh-octo-sts: %s token delivered again to %s, which had lost it', `${this.config.scope}/${this.config.identity}`, again.join(', '))
     }
-    this.schedule(this.report(fresh, exchangeError, !due && !attempted))
+    this.schedule(this.report(fresh, !due && !attempted))
   }
 
   private recover(error: unknown): void {
@@ -206,39 +217,39 @@ class OwnerRefresher {
     this.schedule(delay)
   }
 
-  private async deliver(target: Destination, current: Issued, fresh: boolean): Promise<boolean> {
-    let delivery = this.deliveries.get(target.label) ?? {}
-    if (delivery.issuedAt === current.issuedAt) {
-      if (await target.holds(delivery.marker)) return false
-      delivery = {}
-    }
-    if (delivery.permanent && !fresh) return false
+  private async deliver(target: Destination, current: Issued, fresh: boolean): Promise<'written' | 'redelivered' | 'failed' | undefined> {
+    const delivery = this.deliveries.get(target.label) ?? {}
+    const lost = delivery.issuedAt === current.issuedAt && delivery.error === undefined
+    if (lost && await target.holds(delivery.marker)) return undefined
+    if (delivery.permanent && !fresh) return undefined
     try {
       const marker = await target.write(current.token, this.controller.signal)
       this.deliveries.set(target.label, { issuedAt: current.issuedAt, marker })
+      return lost ? 'redelivered' : 'written'
     } catch (error) {
       this.deliveries.set(target.label, { issuedAt: delivery.issuedAt, error: redact(message(error), [current.token]), permanent: error instanceof PermanentError })
+      return 'failed'
     }
-    return true
   }
 
-  private report(fresh: boolean, exchangeError: ExchangeFailure | undefined, quiet: boolean): number {
+  private report(fresh: boolean, quiet: boolean): number {
     const now = this.now()
+    const untilExchange = Math.max(this.exchangeAt - now, 0)
+    if (quiet) return Math.min(untilExchange, HOLD_CHECK_MS)
+    const exchangeError = this.exchangeFailure
     const failed = this.targets.flatMap(target => {
       const delivery = this.deliveries.get(target.label)
-      return delivery?.error === undefined || delivery.issuedAt === this.current?.issuedAt ? [] : [{ label: target.label, ...delivery }]
+      return delivery?.error === undefined ? [] : [{ label: target.label, ...delivery }]
     })
     const retrying = exchangeError !== undefined || failed.some(delivery => !delivery.permanent)
     const recovered = this.failures
     this.failures = retrying ? this.failures + 1 : 0
-    const next = exchangeError?.permanent ? this.interval
-      : retrying || !this.current ? Math.max(retryDelayMs(this.failures), Math.min(exchangeError?.retryAfterMs ?? 0, this.interval))
-      : Math.max(this.current.issuedAt + this.interval - now, 0)
-    const delay = retrying ? next : Math.min(next, HOLD_CHECK_MS)
+    const backingOff = retrying && !exchangeError?.permanent
+    const next = backingOff ? Math.max(retryDelayMs(this.failures), Math.min(exchangeError?.retryAfterMs ?? 0, this.interval)) : untilExchange
+    const delay = backingOff ? next : Math.min(next, HOLD_CHECK_MS)
     const problems = [...exchangeError === undefined ? [] : [`exchange failed: ${exchangeError.text}`],
       ...failed.map(delivery => `${delivery.label}${delivery.permanent ? ' (retried at the next exchange)' : ''}: ${delivery.error}`)]
     const name = `${this.config.scope}/${this.config.identity}`
-    if (quiet) return delay
     if (problems.length === 0) {
       this.repeated = undefined
       if (fresh || recovered > 0) {
