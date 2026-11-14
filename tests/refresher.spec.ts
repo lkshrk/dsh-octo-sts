@@ -672,6 +672,34 @@ describe('TokenRefresher', () => {
     expect(rejections).toEqual([])
   })
 
+  it('logs and reschedules a round that throws, without an unhandled rejection', async () => {
+    vi.useFakeTimers()
+    const { fetcher, calls } = sts()
+    const log = logger()
+    let broken = true
+    const now = () => { if (broken) throw new Error('clock broke'); return Date.now() }
+    const refresher = new TokenRefresher(config({ workspaces: [] }), { store: () => undefined, logger: log, fetch: fetcher, now })
+    const rejections: unknown[] = []
+    const listener = (reason: unknown) => { rejections.push(reason) }
+    process.on('unhandledRejection', listener)
+    try {
+      refresher.start()
+      await vi.advanceTimersByTimeAsync(0)
+      await refresher.settled()
+      expect(log.lines).toEqual([{ level: 'error', text: 'dsh-octo-sts: acme/dsh-yawn refresh failed: clock broke; next attempt in 60 s' }])
+      broken = false
+      await vi.advanceTimersByTimeAsync(MIN)
+      await refresher.settled()
+      expect(calls).toHaveLength(1)
+      expect(tokenFile()).toBe('ghs_token1')
+      expect(log.lines.at(-1)).toMatchObject({ level: 'info', text: expect.stringContaining('after 1 failed attempts') })
+      await refresher.stop()
+    } finally {
+      process.off('unhandledRejection', listener)
+    }
+    expect(rejections).toEqual([])
+  })
+
   it('stops while an exchange is in flight without delivering its token', async () => {
     const { refresher, server, secrets } = harness()
     let release: (response: Response) => void = () => {}

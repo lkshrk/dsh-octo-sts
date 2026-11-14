@@ -164,7 +164,7 @@ class OwnerRefresher {
 
   private schedule(delay: number): void {
     if (this.controller.signal.aborted) return
-    this.timer = setTimeout(() => { this.running = this.round() }, delay)
+    this.timer = setTimeout(() => { this.running = this.round().catch((error: unknown) => this.recover(error)) }, delay)
     this.timer.unref?.()
   }
 
@@ -196,6 +196,14 @@ class OwnerRefresher {
       attempted = results.some(result => result.status === 'fulfilled' && result.value)
     }
     this.schedule(this.report(fresh, exchangeError, !due && !attempted))
+  }
+
+  private recover(error: unknown): void {
+    this.failures += 1
+    const delay = retryDelayMs(this.failures)
+    this.log('error', 'dsh-octo-sts: %s refresh failed: %s; next attempt in %d s', `${this.config.scope}/${this.config.identity}`,
+      redact(message(error), [this.current?.token]), Math.round(delay / 1000))
+    this.schedule(delay)
   }
 
   private async deliver(target: Destination, current: Issued, fresh: boolean): Promise<boolean> {
