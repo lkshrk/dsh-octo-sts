@@ -225,6 +225,7 @@ pnpm check
 Tests stub `fetch` and the secret store; they never call octo-sts. `tests/wrapper.spec.ts` runs the gh wrapper against a fake `gh`, checks that this README shows the exact script from `examples/gh-owner-token.sh`, and runs shellcheck when it is installed. Edit both together.
 
 Pushing a tag `vX.Y.Z` equal to `v` plus the `version` in `package.json` runs `pnpm check` and attaches `dsh-octo-sts-X.Y.Z.tgz` to the GitHub release for that tag.
+It also pushes `ghcr.io/lkshrk/dsh-octo-sts:X.Y.Z`, a `scratch` image for linux/amd64 and linux/arm64 that holds only that tarball at `/`, for mounting as a Kubernetes image volume; the release notes give its digest.
 
 ## License
 
