@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { format } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { OctoStsConfigSchema, ownerSettings, type OctoStsConfig } from '../src/config.ts'
-import { exchange } from '../src/exchange.ts'
+import { exchange, ExchangeRefused, MAX_RETRY_AFTER_MS } from '../src/exchange.ts'
 import { TokenRefresher, readIdentityToken, removeTemporaryFiles, retryDelayMs, writeTokenFile, type SecretStore } from '../src/refresher.ts'
 import { apply, Config } from '../src/index.ts'
 
@@ -240,6 +240,31 @@ describe('exchange', () => {
     await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow(/^octo-sts answered 400: bad request \[31mforged line$/)
     await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow(new RegExp(`^octo-sts answered 400: x{200}$`))
   })
+
+  it('strips format and separator characters and cuts by code point', async () => {
+    const { fetcher, answers } = sts()
+    answers.push(refused(400, 'a b c‎d‮'), refused(400, `${'x'.repeat(199)}😀😀`))
+    await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow(/^octo-sts answered 400: a b c d$/)
+    await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow(new RegExp(`^octo-sts answered 400: x{199}😀$`, 'u'))
+  })
+
+  it('redacts an echoed identity token before cutting the message', async () => {
+    const { fetcher, answers } = sts()
+    const long = `eyJ${'a'.repeat(300)}`
+    answers.push(refused(401, `cannot verify ${long}`))
+    await expect(exchange(request, long, fetcher, signal())).rejects.toThrow(/^octo-sts answered 401: cannot verify \[redacted\]$/)
+  })
+
+  it('reads Retry-After on 429 as seconds or a date, at most an hour', async () => {
+    const { fetcher, answers } = sts()
+    const tooMany = (value: string) => () => Response.json({ message: 'slow down' }, { status: 429, headers: { 'retry-after': value } })
+    answers.push(tooMany('120'), tooMany('99999999999999'), tooMany('soon'), tooMany(new Date(Date.now() - 60_000).toUTCString()))
+    const retryAfter = async () => (await exchange(request, IDENTITY_TOKEN, fetcher, signal()).catch((error: ExchangeRefused) => error) as ExchangeRefused).retryAfterMs
+    expect(await retryAfter()).toBe(120_000)
+    expect(await retryAfter()).toBe(MAX_RETRY_AFTER_MS)
+    expect(await retryAfter()).toBeUndefined()
+    expect(await retryAfter()).toBe(0)
+  })
 })
 
 describe('readIdentityToken', () => {
@@ -389,10 +414,27 @@ describe('TokenRefresher', () => {
     await refresher.stop()
   })
 
+  it('waits at most the refresh interval for a huge Retry-After and backs off normally for an unreadable or past one', async () => {
+    const { refresher, server, advance } = harness()
+    const tooMany = (value: string) => () => Response.json({ message: 'slow down' }, { status: 429, headers: { 'retry-after': value } })
+    server.answers.push(tooMany('99999999999999'), tooMany('soon'), tooMany(new Date(0).toUTCString()))
+    refresher.start()
+    await advance(0)
+    await advance(30 * MIN - 1_000)
+    expect(server.calls).toHaveLength(1)
+    await advance(1_000)
+    expect(server.calls).toHaveLength(2)
+    await advance(2 * MIN)
+    expect(server.calls).toHaveLength(3)
+    await advance(4 * MIN)
+    expect(server.calls).toHaveLength(4)
+    await refresher.stop()
+  })
+
   it('backs off on 408 and 429 and waits at least as long as Retry-After', async () => {
     const { refresher, server, advance } = harness()
     server.answers.push(refused(408, 'slow'), () => Response.json({ message: 'slow down' }, { status: 429, headers: { 'retry-after': '600' } }),
-      () => Response.json({ message: 'slow down' }, { status: 429, headers: { 'retry-after': new Date(Date.now() + 60 * MIN).toUTCString() } }))
+      () => Response.json({ message: 'slow down' }, { status: 429, headers: { 'retry-after': new Date(Date.now() + 20 * MIN).toUTCString() } }))
     refresher.start()
     await advance(0)
     await advance(MIN)
@@ -401,7 +443,7 @@ describe('TokenRefresher', () => {
     expect(server.calls).toHaveLength(2)
     await advance(1_000)
     expect(server.calls).toHaveLength(3)
-    await advance(59 * MIN)
+    await advance(19 * MIN)
     expect(server.calls).toHaveLength(3)
     await advance(MIN)
     expect(server.calls).toHaveLength(4)
@@ -855,6 +897,17 @@ describe('TokenRefresher', () => {
     expect(server.calls[0]!.init.signal!.aborted).toBe(true)
     expect(secrets.secrets.size).toBe(0)
     expect(log.lines).toEqual([])
+  })
+
+  it('logs no part of a long identity token that octo-sts echoes back', async () => {
+    const { refresher, server, log, advance } = harness()
+    writeFileSync(join(dir, 'sa-token'), `eyJ${'b'.repeat(400)}`)
+    server.answers.push(refused(401, `cannot verify eyJ${'b'.repeat(400)}`))
+    refresher.start()
+    await advance(0)
+    expect(log.lines.at(-1)!.text).toContain('octo-sts answered 401: cannot verify [redacted]')
+    expect(JSON.stringify(log.lines)).not.toMatch(/eyJ|bbbb/)
+    await refresher.stop()
   })
 
   it('redacts the identity token from an exchange error in the log', async () => {

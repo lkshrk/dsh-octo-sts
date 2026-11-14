@@ -232,7 +232,7 @@ class OwnerRefresher {
     const recovered = this.failures
     this.failures = retrying ? this.failures + 1 : 0
     const next = exchangeError?.permanent ? this.interval
-      : retrying || !this.current ? Math.max(retryDelayMs(this.failures), exchangeError?.retryAfterMs ?? 0)
+      : retrying || !this.current ? Math.max(retryDelayMs(this.failures), Math.min(exchangeError?.retryAfterMs ?? 0, this.interval))
       : Math.max(this.current.issuedAt + this.interval - now, 0)
     const delay = retrying ? next : Math.min(next, HOLD_CHECK_MS)
     const problems = [...exchangeError === undefined ? [] : [`exchange failed: ${exchangeError.text}`],
