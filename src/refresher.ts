@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises'
+import { access, mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { ownerSettings, type OctoStsConfig, type OwnerSettings } from './config.ts'
 import { exchange } from './exchange.ts'
@@ -9,6 +9,7 @@ export const WRITE_TIMEOUT_MS = 60_000
 export const REGISTER_TIMEOUT_MS = 5 * 60_000
 const FIRST_RETRY_MS = 60_000
 const MAX_RETRY_MS = 5 * 60_000
+const HOLD_CHECK_MS = 60_000
 
 export interface SecretStore {
   setWorkspaceSecret(repositoryUrl: string, name: string, value: string): Promise<unknown>
@@ -24,8 +25,8 @@ export interface RefresherDependencies {
 
 export class PermanentError extends Error {}
 
-interface Destination { label: string; write(token: string, signal: AbortSignal): Promise<void> }
-interface Delivery { issuedAt?: number; error?: string; permanent?: boolean }
+interface Destination { label: string; write(token: string, signal: AbortSignal): Promise<unknown>; holds(marker: unknown): Promise<boolean> }
+interface Delivery { issuedAt?: number; marker?: unknown; error?: string; permanent?: boolean }
 interface Issued { token: string; issuedAt: number }
 
 export const retryDelayMs = (failures: number): number => Math.min(FIRST_RETRY_MS * 2 ** Math.max(failures - 1, 0), MAX_RETRY_MS)
@@ -69,7 +70,7 @@ function destinations(config: OwnerSettings, store: () => SecretStore | undefine
   const result: Destination[] = []
   if (config.tokenFile) {
     const path = config.tokenFile
-    result.push({ label: path, write: token => writeTokenFile(path, token) })
+    result.push({ label: path, write: token => writeTokenFile(path, token), holds: () => access(path).then(() => true, () => false) })
   }
   const register = async (service: SecretStore, workspace: string, signal: AbortSignal) => {
     if (!service.createRepositoryWorkspace) throw new PermanentError('could not register the workspace: sandboxManager has no createRepositoryWorkspace')
@@ -96,11 +97,19 @@ function destinations(config: OwnerSettings, store: () => SecretStore | undefine
       if (!service) throw new Error('the sandboxManager service is not available')
       try {
         await set(service, workspace, token, signal)
+        return service
       } catch (error) {
         if (!unregistered(error)) throw error
         if (!config.registerWorkspaces) throw new PermanentError(message(error))
         await register(service, workspace, signal)
         await set(service, workspace, token, signal).catch((retry: unknown) => { throw unregistered(retry) ? new PermanentError(message(retry)) : retry })
+        return service
+      }
+    }, holds: async marker => {
+      try {
+        return store() === marker
+      } catch {
+        return false
       }
     } })
   }
@@ -177,25 +186,32 @@ class OwnerRefresher {
     if (this.controller.signal.aborted) return
     const fresh = due && exchangeError === undefined
     const current = this.current
+    let attempted = false
     if (current) {
-      await Promise.allSettled(this.targets.map(target => this.deliver(target, current, fresh)))
+      const results = await Promise.allSettled(this.targets.map(target => this.deliver(target, current, fresh)))
       if (this.controller.signal.aborted) return
+      attempted = results.some(result => result.status === 'fulfilled' && result.value)
     }
-    this.schedule(this.report(fresh, exchangeError))
+    this.schedule(this.report(fresh, exchangeError, !due && !attempted))
   }
 
-  private async deliver(target: Destination, current: Issued, fresh: boolean): Promise<void> {
-    const delivery = this.deliveries.get(target.label) ?? {}
-    if (delivery.issuedAt === current.issuedAt || (delivery.permanent && !fresh)) return
+  private async deliver(target: Destination, current: Issued, fresh: boolean): Promise<boolean> {
+    let delivery = this.deliveries.get(target.label) ?? {}
+    if (delivery.issuedAt === current.issuedAt) {
+      if (await target.holds(delivery.marker)) return false
+      delivery = {}
+    }
+    if (delivery.permanent && !fresh) return false
     try {
-      await target.write(current.token, this.controller.signal)
-      this.deliveries.set(target.label, { issuedAt: current.issuedAt })
+      const marker = await target.write(current.token, this.controller.signal)
+      this.deliveries.set(target.label, { issuedAt: current.issuedAt, marker })
     } catch (error) {
       this.deliveries.set(target.label, { issuedAt: delivery.issuedAt, error: redact(message(error), [current.token]), permanent: error instanceof PermanentError })
     }
+    return true
   }
 
-  private report(fresh: boolean, exchangeError: string | undefined): number {
+  private report(fresh: boolean, exchangeError: string | undefined, quiet: boolean): number {
     const now = this.now()
     const failed = this.targets.flatMap(target => {
       const delivery = this.deliveries.get(target.label)
@@ -204,14 +220,16 @@ class OwnerRefresher {
     const retrying = exchangeError !== undefined || failed.some(delivery => !delivery.permanent)
     const recovered = this.failures
     this.failures = retrying ? this.failures + 1 : 0
-    const delay = retrying || !this.current ? retryDelayMs(this.failures) : Math.max(this.current.issuedAt + this.interval - now, 0)
+    const next = retrying || !this.current ? retryDelayMs(this.failures) : Math.max(this.current.issuedAt + this.interval - now, 0)
+    const delay = retrying ? next : Math.min(next, HOLD_CHECK_MS)
     const problems = [...exchangeError === undefined ? [] : [`exchange failed: ${exchangeError}`],
       ...failed.map(delivery => `${delivery.label}${delivery.permanent ? ' (retried at the next exchange)' : ''}: ${delivery.error}`)]
     const name = `${this.config.scope}/${this.config.identity}`
+    if (quiet) return delay
     if (problems.length === 0) {
       if (fresh || recovered > 0) {
         this.log('info', 'dsh-octo-sts: %s token delivered to every destination%s; next exchange in %d min', name,
-          recovered > 0 ? ` after ${recovered} failed attempts` : '', Math.round(delay / 60_000))
+          recovered > 0 ? ` after ${recovered} failed attempts` : '', Math.round(next / 60_000))
       }
       return delay
     }
@@ -220,7 +238,7 @@ class OwnerRefresher {
       return issuedAt !== undefined && issuedAt + TOKEN_LIFETIME_MS > now
     })
     this.log(valid ? 'warn' : 'error', 'dsh-octo-sts: %s %s; %s; next attempt in %d s', name, problems.join('; '),
-      valid ? 'destinations keep their last token until it expires' : 'no destination holds a valid token', Math.round(delay / 1000))
+      valid ? 'destinations keep their last token until it expires' : 'no destination holds a valid token', Math.round(next / 1000))
     return delay
   }
 
