@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto'
 import { access, mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { ownerSettings, type OctoStsConfig, type OwnerSettings } from './config.ts'
-import { exchange } from './exchange.ts'
+import { exchange, ExchangeRefused } from './exchange.ts'
 
 export const TOKEN_LIFETIME_MS = 60 * 60_000
 export const WRITE_TIMEOUT_MS = 60_000
@@ -28,6 +28,7 @@ export class PermanentError extends Error {}
 interface Destination { label: string; write(token: string, signal: AbortSignal): Promise<unknown>; holds(marker: unknown): Promise<boolean> }
 interface Delivery { issuedAt?: number; marker?: unknown; error?: string; permanent?: boolean }
 interface Issued { token: string; issuedAt: number }
+interface ExchangeFailure { text: string; permanent: boolean; retryAfterMs?: number }
 
 export const retryDelayMs = (failures: number): number => Math.min(FIRST_RETRY_MS * 2 ** Math.max(failures - 1, 0), MAX_RETRY_MS)
 
@@ -139,6 +140,7 @@ class OwnerRefresher {
   private running: Promise<void> | undefined
   private current: Issued | undefined
   private failures = 0
+  private repeated: string | undefined
   private started = false
 
   constructor(private readonly config: OwnerSettings, private readonly dependencies: RefresherDependencies, registering: Registrations) {
@@ -172,7 +174,7 @@ class OwnerRefresher {
       if (this.config.tokenFile) await removeTemporaryFiles(this.config.tokenFile).catch(() => undefined)
     }
     const due = !this.current || this.now() >= this.current.issuedAt + this.interval
-    let exchangeError: string | undefined
+    let exchangeError: ExchangeFailure | undefined
     if (due) {
       const issuedAt = this.now()
       let identityToken: string | undefined
@@ -180,7 +182,8 @@ class OwnerRefresher {
         identityToken = await readIdentityToken(this.config.identityTokenFile)
         this.current = { token: await exchange(this.config, identityToken, this.dependencies.fetch ?? fetch, this.controller.signal), issuedAt }
       } catch (error) {
-        exchangeError = redact(message(error), [identityToken])
+        const refused = error instanceof ExchangeRefused ? error : undefined
+        exchangeError = { text: redact(message(error), [identityToken]), permanent: refused?.permanent ?? false, retryAfterMs: refused?.retryAfterMs }
       }
     }
     if (this.controller.signal.aborted) return
@@ -211,7 +214,7 @@ class OwnerRefresher {
     return true
   }
 
-  private report(fresh: boolean, exchangeError: string | undefined, quiet: boolean): number {
+  private report(fresh: boolean, exchangeError: ExchangeFailure | undefined, quiet: boolean): number {
     const now = this.now()
     const failed = this.targets.flatMap(target => {
       const delivery = this.deliveries.get(target.label)
@@ -220,13 +223,16 @@ class OwnerRefresher {
     const retrying = exchangeError !== undefined || failed.some(delivery => !delivery.permanent)
     const recovered = this.failures
     this.failures = retrying ? this.failures + 1 : 0
-    const next = retrying || !this.current ? retryDelayMs(this.failures) : Math.max(this.current.issuedAt + this.interval - now, 0)
+    const next = exchangeError?.permanent ? this.interval
+      : retrying || !this.current ? Math.max(retryDelayMs(this.failures), exchangeError?.retryAfterMs ?? 0)
+      : Math.max(this.current.issuedAt + this.interval - now, 0)
     const delay = retrying ? next : Math.min(next, HOLD_CHECK_MS)
-    const problems = [...exchangeError === undefined ? [] : [`exchange failed: ${exchangeError}`],
+    const problems = [...exchangeError === undefined ? [] : [`exchange failed: ${exchangeError.text}`],
       ...failed.map(delivery => `${delivery.label}${delivery.permanent ? ' (retried at the next exchange)' : ''}: ${delivery.error}`)]
     const name = `${this.config.scope}/${this.config.identity}`
     if (quiet) return delay
     if (problems.length === 0) {
+      this.repeated = undefined
       if (fresh || recovered > 0) {
         this.log('info', 'dsh-octo-sts: %s token delivered to every destination%s; next exchange in %d min', name,
           recovered > 0 ? ` after ${recovered} failed attempts` : '', Math.round(next / 60_000))
@@ -237,7 +243,11 @@ class OwnerRefresher {
       const issuedAt = this.deliveries.get(target.label)?.issuedAt
       return issuedAt !== undefined && issuedAt + TOKEN_LIFETIME_MS > now
     })
-    this.log(valid ? 'warn' : 'error', 'dsh-octo-sts: %s %s; %s; next attempt in %d s', name, problems.join('; '),
+    const level = valid ? 'warn' : 'error'
+    const key = exchangeError?.permanent ? `${level} ${problems.join('; ')}` : undefined
+    if (key !== undefined && key === this.repeated) return delay
+    this.repeated = key
+    this.log(level, 'dsh-octo-sts: %s %s; %s; next attempt in %d s', name, problems.join('; '),
       valid ? 'destinations keep their last token until it expires' : 'no destination holds a valid token', Math.round(next / 1000))
     return delay
   }

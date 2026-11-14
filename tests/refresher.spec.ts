@@ -367,6 +367,47 @@ describe('TokenRefresher', () => {
     await refresher.stop()
   })
 
+  it('retries a 4xx refusal other than 408 and 429 on the refresh schedule and logs it once', async () => {
+    const { refresher, server, log, advance } = harness()
+    for (let i = 0; i < 3; i++) server.answers.push(refused(403, 'identity not allowed'))
+    refresher.start()
+    await advance(0)
+    expect(log.lines).toEqual([{ level: 'error', text: expect.stringContaining('exchange failed: octo-sts answered 403: identity not allowed; no destination holds a valid token; next attempt in 1800 s') }])
+    await advance(30 * MIN - 1_000)
+    expect(server.calls).toHaveLength(1)
+    await advance(1_000)
+    expect(server.calls).toHaveLength(2)
+    expect(log.lines).toHaveLength(1)
+    server.answers.splice(0, 1, refused(401, 'token expired'))
+    await advance(30 * MIN)
+    expect(server.calls).toHaveLength(3)
+    expect(log.lines).toHaveLength(2)
+    expect(log.lines.at(-1)!.text).toContain('octo-sts answered 401: token expired')
+    await advance(30 * MIN)
+    expect(server.calls).toHaveLength(4)
+    expect(log.lines.at(-1)).toMatchObject({ level: 'info', text: expect.stringContaining('after 3 failed attempts') })
+    await refresher.stop()
+  })
+
+  it('backs off on 408 and 429 and waits at least as long as Retry-After', async () => {
+    const { refresher, server, advance } = harness()
+    server.answers.push(refused(408, 'slow'), () => Response.json({ message: 'slow down' }, { status: 429, headers: { 'retry-after': '600' } }),
+      () => Response.json({ message: 'slow down' }, { status: 429, headers: { 'retry-after': new Date(Date.now() + 60 * MIN).toUTCString() } }))
+    refresher.start()
+    await advance(0)
+    await advance(MIN)
+    expect(server.calls).toHaveLength(2)
+    await advance(10 * MIN - 1_000)
+    expect(server.calls).toHaveLength(2)
+    await advance(1_000)
+    expect(server.calls).toHaveLength(3)
+    await advance(59 * MIN)
+    expect(server.calls).toHaveLength(3)
+    await advance(MIN)
+    expect(server.calls).toHaveLength(4)
+    await refresher.stop()
+  })
+
   it('keeps the previous token on exchange failure, backs off and recovers', async () => {
     const { refresher, server, secrets, log, advance } = harness()
     refresher.start()
@@ -798,7 +839,7 @@ describe('TokenRefresher with several owners', () => {
     const fetcher = vi.fn(async (url: string | URL | Request) => {
       const scope = new URL(String(url)).searchParams.get('scope')!
       calls.push(scope)
-      if (refusing.has(scope)) return Response.json({ message: `${scope} refused` }, { status: 403 })
+      if (refusing.has(scope)) return Response.json({ message: `${scope} refused` }, { status: 503 })
       const count = (issued.get(scope) ?? 0) + 1
       issued.set(scope, count)
       return Response.json({ token: `ghs_${scope}${count}` })
@@ -842,7 +883,7 @@ describe('TokenRefresher with several owners', () => {
     expect(secrets.secrets.has(`${GLOBEX} GITHUB_TOKEN`)).toBe(false)
     expect(() => read('globex')).toThrow()
     expect(log.lines).toContainEqual({ level: 'info', text: expect.stringContaining('acme/dsh-yawn token delivered') })
-    expect(log.lines).toContainEqual({ level: 'error', text: expect.stringContaining('globex/dsh-yawn exchange failed: octo-sts answered 403: globex refused') })
+    expect(log.lines).toContainEqual({ level: 'error', text: expect.stringContaining('globex/dsh-yawn exchange failed: octo-sts answered 503: globex refused') })
     await advance(MIN + 2 * MIN + 4 * MIN)
     expect(calls.filter(scope => scope === 'globex')).toHaveLength(4)
     expect(calls.filter(scope => scope === 'acme')).toHaveLength(1)

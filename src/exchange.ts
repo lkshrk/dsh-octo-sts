@@ -7,6 +7,12 @@ export const EXCHANGE_TIMEOUT_MS = 30_000
 
 export interface ExchangeRequest { sts: string; scope: string; identity: string }
 
+export class ExchangeRefused extends Error {
+  constructor(message: string, readonly status: number, readonly retryAfterMs?: number) { super(message) }
+
+  get permanent(): boolean { return this.status >= 400 && this.status < 500 && this.status !== 408 && this.status !== 429 }
+}
+
 export async function exchange(request: ExchangeRequest, identityToken: string, fetcher: typeof fetch, signal: AbortSignal): Promise<string> {
   const url = new URL('/sts/exchange', request.sts)
   url.searchParams.set('scope', request.scope)
@@ -24,7 +30,10 @@ export async function exchange(request: ExchangeRequest, identityToken: string, 
     } catch (error) {
       throw withCause(error, identityToken)
     }
-    if (!response.ok) throw new Error(`octo-sts answered ${response.status}: ${await reason(response)}`)
+    if (!response.ok) {
+      throw new ExchangeRefused(`octo-sts answered ${response.status}: ${await reason(response)}`, response.status,
+        response.status === 429 ? retryAfterMs(response) : undefined)
+    }
     const parsed = TokenSchema.safeParse(await response.json().catch(() => undefined))
     if (!parsed.success) throw new Error('octo-sts answered without a token')
     return parsed.data.token
@@ -42,6 +51,13 @@ function withCause(error: unknown, identityToken: string): unknown {
   const detail = typeof code === 'string' ? code : typeof message === 'string' ? message : ''
   if (!detail) return error
   return new Error(printable(`${error.message}: ${detail}`).replaceAll(identityToken, '[redacted]'), { cause: error })
+}
+
+function retryAfterMs(response: Response): number | undefined {
+  const value = response.headers.get('retry-after')?.trim()
+  if (!value) return undefined
+  const ms = /^\d+$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now()
+  return Number.isFinite(ms) ? Math.max(ms, 0) : undefined
 }
 
 async function reason(response: Response): Promise<string> {
