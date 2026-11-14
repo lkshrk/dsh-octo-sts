@@ -208,6 +208,7 @@ Configuration errors stop the plugin from loading. The message names the key and
 ## Development
 
 After cloning, run `mise install` and `lefthook install` once to get the pinned tools and the pre-commit and pre-push hooks.
+mise takes Node from `.node-version`; run `corepack enable` once so pnpm comes from `packageManager` in `package.json`.
 
 ```sh
 pnpm install
