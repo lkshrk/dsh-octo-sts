@@ -24,7 +24,7 @@ export interface RefresherDependencies {
 
 export class PermanentError extends Error {}
 
-interface Destination { label: string; write(token: string): Promise<void> }
+interface Destination { label: string; write(token: string, signal: AbortSignal): Promise<void> }
 interface Delivery { issuedAt?: number; error?: string; permanent?: boolean }
 interface Issued { token: string; issuedAt: number }
 
@@ -71,7 +71,7 @@ function destinations(config: OwnerSettings, store: () => SecretStore | undefine
     const path = config.tokenFile
     result.push({ label: path, write: token => writeTokenFile(path, token) })
   }
-  const register = async (service: SecretStore, workspace: string) => {
+  const register = async (service: SecretStore, workspace: string, signal: AbortSignal) => {
     if (!service.createRepositoryWorkspace) throw new PermanentError('could not register the workspace: sandboxManager has no createRepositoryWorkspace')
     let pending = registering.get(workspace)
     if (!pending) {
@@ -81,26 +81,26 @@ function destinations(config: OwnerSettings, store: () => SecretStore | undefine
       registering.set(workspace, pending)
     }
     try {
-      await withTimeout(pending, 'timed out', REGISTER_TIMEOUT_MS)
+      await withTimeout(pending, 'timed out', REGISTER_TIMEOUT_MS, signal)
     } catch (error) {
       const detail = `could not register the workspace: ${message(error)}`
       throw /require the dsh Web profile/.test(message(error)) ? new PermanentError(detail) : new Error(detail)
     }
   }
-  const set = (service: SecretStore, workspace: string, token: string) =>
-    withTimeout(Promise.resolve().then(() => service.setWorkspaceSecret(workspace, config.secretName, token)), 'timed out', WRITE_TIMEOUT_MS)
+  const set = (service: SecretStore, workspace: string, token: string, signal: AbortSignal) =>
+    withTimeout(Promise.resolve().then(() => service.setWorkspaceSecret(workspace, config.secretName, token)), 'timed out', WRITE_TIMEOUT_MS, signal)
   const unregistered = (error: unknown) => /workspace is not registered/.test(message(error))
   for (const workspace of new Set(config.workspaces)) {
-    result.push({ label: workspace, write: async token => {
+    result.push({ label: workspace, write: async (token, signal) => {
       const service = store()
       if (!service) throw new Error('the sandboxManager service is not available')
       try {
-        await set(service, workspace, token)
+        await set(service, workspace, token, signal)
       } catch (error) {
         if (!unregistered(error)) throw error
         if (!config.registerWorkspaces) throw new PermanentError(message(error))
-        await register(service, workspace)
-        await set(service, workspace, token).catch((retry: unknown) => { throw unregistered(retry) ? new PermanentError(message(retry)) : retry })
+        await register(service, workspace, signal)
+        await set(service, workspace, token, signal).catch((retry: unknown) => { throw unregistered(retry) ? new PermanentError(message(retry)) : retry })
       }
     } })
   }
@@ -178,19 +178,21 @@ class OwnerRefresher {
     const fresh = due && exchangeError === undefined
     const current = this.current
     if (current) {
-      for (const target of this.targets) {
-        const delivery = this.deliveries.get(target.label) ?? {}
-        if (delivery.issuedAt === current.issuedAt || (delivery.permanent && !fresh)) continue
-        try {
-          await target.write(current.token)
-          this.deliveries.set(target.label, { issuedAt: current.issuedAt })
-        } catch (error) {
-          this.deliveries.set(target.label, { issuedAt: delivery.issuedAt, error: redact(message(error), [current.token]), permanent: error instanceof PermanentError })
-        }
-        if (this.controller.signal.aborted) return
-      }
+      await Promise.allSettled(this.targets.map(target => this.deliver(target, current, fresh)))
+      if (this.controller.signal.aborted) return
     }
     this.schedule(this.report(fresh, exchangeError))
+  }
+
+  private async deliver(target: Destination, current: Issued, fresh: boolean): Promise<void> {
+    const delivery = this.deliveries.get(target.label) ?? {}
+    if (delivery.issuedAt === current.issuedAt || (delivery.permanent && !fresh)) return
+    try {
+      await target.write(current.token, this.controller.signal)
+      this.deliveries.set(target.label, { issuedAt: current.issuedAt })
+    } catch (error) {
+      this.deliveries.set(target.label, { issuedAt: delivery.issuedAt, error: redact(message(error), [current.token]), permanent: error instanceof PermanentError })
+    }
   }
 
   private report(fresh: boolean, exchangeError: string | undefined): number {
@@ -237,12 +239,19 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-async function withTimeout<T>(promise: Promise<T>, detail: string, ms: number): Promise<T> {
+async function withTimeout<T>(promise: Promise<T>, detail: string, ms: number, signal: AbortSignal): Promise<T> {
   let timer: NodeJS.Timeout | undefined
-  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(detail)), ms) })
+  let onAbort: (() => void) | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(detail)), ms)
+    onAbort = () => reject(new Error('stopped'))
+    if (signal.aborted) onAbort()
+    else signal.addEventListener('abort', onAbort, { once: true })
+  })
   try {
     return await Promise.race([promise, timeout])
   } finally {
     clearTimeout(timer)
+    signal.removeEventListener('abort', onAbort!)
   }
 }

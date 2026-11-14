@@ -685,6 +685,39 @@ describe('TokenRefresher', () => {
     await refresher.stop()
   })
 
+  it('delivers to every other destination while one write hangs', async () => {
+    const { refresher, secrets, log } = harness({ workspaces: [WORKSPACE, OTHER] })
+    secrets.registered.add(WORKSPACE).add(OTHER)
+    secrets.setWorkspaceSecret.mockImplementation(async (url: string, name: string, secret: string) => {
+      if (url === WORKSPACE) return await new Promise(() => {})
+      secrets.secrets.set(`${url} ${name}`, secret)
+      return {}
+    })
+    refresher.start()
+    await vi.waitFor(() => expect(secrets.secrets.get(`${OTHER} GITHUB_TOKEN`)).toBe('ghs_token1'))
+    expect(tokenFile()).toBe('ghs_token1')
+    expect(log.lines).toEqual([])
+    await vi.advanceTimersByTimeAsync(60_000)
+    await refresher.settled()
+    expect(log.lines.at(-1)!.text).toContain(`${WORKSPACE}: timed out`)
+    await refresher.stop()
+  })
+
+  it('stops at once while a workspace write or registration hangs', async () => {
+    for (const hung of ['write', 'registration'] as const) {
+      const { refresher, secrets } = harness()
+      if (hung === 'write') secrets.setWorkspaceSecret.mockImplementation(() => new Promise(() => {}))
+      else secrets.createRepositoryWorkspace.mockImplementation(() => new Promise(() => {}))
+      refresher.start()
+      await vi.waitFor(() => expect(hung === 'write' ? secrets.setWorkspaceSecret : secrets.createRepositoryWorkspace).toHaveBeenCalled())
+      let stopped = false
+      const stopping = refresher.stop().then(() => { stopped = true })
+      await vi.waitFor(() => expect(stopped, hung).toBe(true))
+      await stopping
+      vi.useRealTimers()
+    }
+  })
+
   it('aborts the exchange in flight on stop', async () => {
     const { refresher, server, secrets, log } = harness()
     vi.mocked(server.fetcher).mockImplementation(async (url, init) => {
