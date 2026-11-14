@@ -1,7 +1,7 @@
 {
   "name": "dsh-octo-sts",
   "description": "Keeps a short-lived GitHub token from octo-sts in dsh-yawn's sandbox secrets and in a file for the control plane.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
