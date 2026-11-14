@@ -243,7 +243,7 @@ describe('exchange', () => {
 
   it('strips format and separator characters and cuts by code point', async () => {
     const { fetcher, answers } = sts()
-    answers.push(refused(400, 'a b c‎d‮'), refused(400, `${'x'.repeat(199)}😀😀`))
+    answers.push(refused(400, 'a\u2028b\u2029c\u200ed\u202e'), refused(400, `${'x'.repeat(199)}😀😀`))
     await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow(/^octo-sts answered 400: a b c d$/)
     await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow(new RegExp(`^octo-sts answered 400: x{199}😀$`, 'u'))
   })
@@ -410,7 +410,7 @@ describe('TokenRefresher', () => {
     expect(log.lines.at(-1)!.text).toContain('octo-sts answered 401: token expired')
     await advance(30 * MIN)
     expect(server.calls).toHaveLength(4)
-    expect(log.lines.at(-1)).toMatchObject({ level: 'info', text: expect.stringContaining('after 3 failed attempts') })
+    expect(log.lines.at(-1)).toMatchObject({ level: 'info', text: expect.stringContaining('after 3 failed exchanges;') })
     await refresher.stop()
   })
 
@@ -467,7 +467,7 @@ describe('TokenRefresher', () => {
     await advance(2 * MIN)
     expect(server.calls).toHaveLength(4)
     expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token2')
-    expect(log.lines.at(-1)!.text).toContain('after 2 failed attempts')
+    expect(log.lines.at(-1)!.text).toContain('after 2 failed exchanges;')
     expect(JSON.stringify(log.lines)).not.toMatch(/ghs_|eyJ/)
     await refresher.stop()
   })
@@ -745,7 +745,7 @@ describe('TokenRefresher', () => {
       await refresher.settled()
       expect(calls).toHaveLength(1)
       expect(tokenFile()).toBe('ghs_token1')
-      expect(log.lines.at(-1)).toMatchObject({ level: 'info', text: expect.stringContaining('after 1 failed attempts') })
+      expect(log.lines.at(-1)).toEqual({ level: 'info', text: 'dsh-octo-sts: acme/dsh-yawn token delivered to every destination; next exchange in 30 min' })
       await refresher.stop()
     } finally {
       process.off('unhandledRejection', listener)
@@ -865,8 +865,38 @@ describe('TokenRefresher', () => {
     service = store({ registered: [WORKSPACE] }).value
     await vi.advanceTimersByTimeAsync(MIN)
     await refresher.settled()
-    expect(log.lines.at(-1)).toMatchObject({ level: 'info', text: expect.stringContaining('after 1 failed attempts') })
+    expect(log.lines.at(-1)).toEqual({ level: 'info', text: 'dsh-octo-sts: acme/dsh-yawn token delivered to every destination; next exchange in 28 min' })
     expect(server.calls).toHaveLength(1)
+    await refresher.stop()
+  })
+
+  it('counts only exchange attempts, not repair rounds, in the recovery message', async () => {
+    const { refresher, server, secrets, log, advance } = harness()
+    secrets.registered.add(WORKSPACE)
+    refresher.start()
+    await advance(0)
+    server.answers.push(refused(403, 'identity not allowed'), refused(403, 'identity not allowed'))
+    await advance(30 * MIN)
+    rmSync(join(dir, 'run', 'gh.token'))
+    await advance(2 * MIN)
+    expect(tokenFile()).toBe('ghs_token1')
+    await advance(58 * MIN)
+    expect(server.calls).toHaveLength(4)
+    expect(log.lines.at(-1)).toEqual({ level: 'info', text: 'dsh-octo-sts: acme/dsh-yawn token delivered to every destination after 2 failed exchanges; next exchange in 30 min' })
+    await refresher.stop()
+  })
+
+  it('does not deliver a token again once it has expired', async () => {
+    const { refresher, server, secrets, log, advance } = harness()
+    secrets.registered.add(WORKSPACE)
+    refresher.start()
+    await advance(0)
+    server.answers.push(refused(403, 'identity not allowed'), refused(403, 'identity not allowed'))
+    await advance(61 * MIN)
+    rmSync(join(dir, 'run', 'gh.token'))
+    await advance(5 * MIN)
+    expect(() => tokenFile()).toThrow()
+    expect(log.lines.filter(line => line.text.includes('delivered again'))).toEqual([])
     await refresher.stop()
   })
 

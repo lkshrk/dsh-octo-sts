@@ -146,6 +146,7 @@ class OwnerRefresher {
   private exchangeAt = -Infinity
   private exchangeFailure: ExchangeFailure | undefined
   private failures = 0
+  private failedExchanges = 0
   private repeated: string | undefined
   private started = false
 
@@ -191,6 +192,7 @@ class OwnerRefresher {
       } catch (error) {
         const refused = error instanceof ExchangeRefused ? error : undefined
         this.exchangeFailure = { text: redact(message(error), [identityToken]), permanent: refused?.permanent ?? false, retryAfterMs: refused?.retryAfterMs }
+        this.failedExchanges += 1
         if (this.exchangeFailure.permanent) this.exchangeAt = this.now() + this.interval
       }
     }
@@ -219,6 +221,7 @@ class OwnerRefresher {
 
   private async deliver(target: Destination, current: Issued, fresh: boolean): Promise<'written' | 'redelivered' | 'failed' | undefined> {
     const delivery = this.deliveries.get(target.label) ?? {}
+    if (this.now() >= current.issuedAt + TOKEN_LIFETIME_MS) return undefined
     const lost = delivery.issuedAt === current.issuedAt && delivery.error === undefined
     if (lost && await target.holds(delivery.marker)) return undefined
     if (delivery.permanent && !fresh) return undefined
@@ -252,9 +255,11 @@ class OwnerRefresher {
     const name = `${this.config.scope}/${this.config.identity}`
     if (problems.length === 0) {
       this.repeated = undefined
-      if (fresh || recovered > 0) {
+      const failedExchanges = this.failedExchanges
+      this.failedExchanges = 0
+      if (fresh || recovered > 0 || failedExchanges > 0) {
         this.log('info', 'dsh-octo-sts: %s token delivered to every destination%s; next exchange in %d min', name,
-          recovered > 0 ? ` after ${recovered} failed attempts` : '', Math.round(next / 60_000))
+          failedExchanges > 0 ? ` after ${failedExchanges} failed exchange${failedExchanges === 1 ? '' : 's'}` : '', Math.round(next / 60_000))
       }
       return delay
     }
