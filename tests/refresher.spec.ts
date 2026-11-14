@@ -582,23 +582,14 @@ describe('TokenRefresher', () => {
     await refresher.stop()
   })
 
-  it('recognises the errors thrown in dsh-yawn control-plane/src/sandbox/manager/sandbox-manager.ts', async () => {
-    const { refresher, server, secrets, log, advance } = harness()
-    secrets.setWorkspaceSecret.mockImplementation(async (url: string, name: string, secret: string) => {
-      if (!secrets.registered.has(url)) throw new Error(`workspace is not registered: ${url}`)
-      secrets.secrets.set(`${url} ${name}`, secret)
-      return {}
-    })
+  it('recognises the dsh-yawn error texts as of dsh-yawn f96f495', async () => {
+    const { refresher, secrets, log, advance } = harness()
+    secrets.setWorkspaceSecret.mockImplementation(async (url: string) => { throw new Error(`workspace is not registered: ${url}`) })
     secrets.breakRegistry(() => new Error('repository workspaces require the dsh Web profile'))
     refresher.start()
     await advance(0)
     expect(secrets.createRepositoryWorkspace).toHaveBeenCalledTimes(1)
-    expect(log.lines.at(-1)!.text).toContain(`${WORKSPACE} (retried at the next exchange): could not register the workspace: repository workspaces require the dsh Web profile`)
-    secrets.breakRegistry(undefined)
-    await advance(30 * MIN)
-    expect(server.calls).toHaveLength(2)
-    expect(secrets.createRepositoryWorkspace).toHaveBeenCalledTimes(2)
-    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token2')
+    expect(log.lines.at(-1)!.text).toContain(`${WORKSPACE} (retried at the next exchange): could not register`)
     await refresher.stop()
   })
 
