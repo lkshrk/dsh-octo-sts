@@ -4,7 +4,8 @@ import { z } from 'zod'
 const absolutePath = z.string().trim().refine(isAbsolute, 'must be an absolute path')
 const identity = z.string().trim().min(1).regex(/^[^/\s\p{Cc}]+$/u, 'must be a single path segment')
   .refine(value => value !== '.' && value !== '..', 'must be a single path segment')
-const scope = z.string().trim().min(1)
+const scope = z.string().trim()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\/(?!\.\.?$)[A-Za-z0-9._-]{1,100})?$/, 'must be <owner> or <owner>/<repository>')
 
 const httpsUrl = z.url({ protocol: /^https$/ })
   .refine(value => { const url = new URL(value); return !url.username && !url.password }, 'must not contain credentials')

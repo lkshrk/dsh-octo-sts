@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { format } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { OctoStsConfigSchema, ownerSettings, type OctoStsConfig } from '../src/config.ts'
-import { exchange } from '../src/exchange.ts'
+import { exchange, ExchangeRefused, MAX_RETRY_AFTER_MS } from '../src/exchange.ts'
 import { TokenRefresher, readIdentityToken, removeTemporaryFiles, retryDelayMs, writeTokenFile, type SecretStore } from '../src/refresher.ts'
 import { apply, Config } from '../src/index.ts'
 
@@ -104,6 +104,19 @@ describe('config', () => {
     expect(OctoStsConfigSchema.safeParse({ ...base, tokenFile: 'gh.token' }).success).toBe(false)
     expect(OctoStsConfigSchema.safeParse({ ...base, identityTokenFile: 'token' }).success).toBe(false)
     expect(OctoStsConfigSchema.safeParse({ ...base, extra: true }).success).toBe(false)
+  })
+
+  it('accepts only <owner> or <owner>/<repository> as scope', () => {
+    for (const scope of ['acme', 'Acme-Corp', 'acme/widgets', 'acme/my.repo_name-2', ' acme ']) {
+      expect(OctoStsConfigSchema.safeParse({ ...base, scope, workspaces: [], tokenFile: '/run/gh.token' }).success, scope).toBe(true)
+    }
+    for (const scope of ['', '-acme', 'ac_me', 'acme/', '/widgets', 'acme/widgets/x', 'acme/..', 'acme/.', 'acme/wid gets', 'a'.repeat(40), 'acme/a?b']) {
+      const result = OctoStsConfigSchema.safeParse({ ...base, scope, workspaces: [], tokenFile: '/run/gh.token' })
+      expect(result.success, scope).toBe(false)
+      expect(result.error?.issues.map(issue => `${issue.path.join('.')}: ${issue.message}`), scope).toContain('scope: must be <owner> or <owner>/<repository>')
+    }
+    expect(OctoStsConfigSchema.safeParse({ owners: [{ scope: 'acme/a/b', identity: 'dsh-yawn', tokenFile: '/run/gh.token' }] }).error?.issues[0])
+      .toMatchObject({ path: ['owners', 0, 'scope'], message: 'must be <owner> or <owner>/<repository>' })
   })
 
   it('accepts only an https server root without credentials as sts', () => {
@@ -210,6 +223,47 @@ describe('exchange', () => {
     answers.push(() => Response.json({ token: '' }), () => new Response('not json'))
     await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('without a token')
     await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('without a token')
+  })
+
+  it('names the network cause of a failed fetch without the identity token', async () => {
+    const failing = (cause: unknown) => vi.fn(async () => { throw new TypeError('fetch failed', { cause }) }) as unknown as typeof fetch
+    const refusedConnection = Object.assign(new Error('connect ECONNREFUSED 10.0.0.1:443'), { code: 'ECONNREFUSED' })
+    await expect(exchange(request, IDENTITY_TOKEN, failing(refusedConnection), signal())).rejects.toThrow(/^fetch failed: ECONNREFUSED$/)
+    await expect(exchange(request, IDENTITY_TOKEN, failing(new Error(`certificate has expired\nfor ${IDENTITY_TOKEN}`)), signal()))
+      .rejects.toThrow(/^fetch failed: certificate has expired for \[redacted\]$/)
+    await expect(exchange(request, IDENTITY_TOKEN, failing(undefined), signal())).rejects.toThrow(/^fetch failed$/)
+  })
+
+  it('strips control characters from the octo-sts message and keeps 200 characters', async () => {
+    const { fetcher, answers } = sts()
+    answers.push(refused(400, 'bad\nrequest\r\n\u001b[31mforged line'), refused(400, 'x'.repeat(250)))
+    await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow(/^octo-sts answered 400: bad request \[31mforged line$/)
+    await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow(new RegExp(`^octo-sts answered 400: x{200}$`))
+  })
+
+  it('strips format and separator characters and cuts by code point', async () => {
+    const { fetcher, answers } = sts()
+    answers.push(refused(400, 'a\u2028b\u2029c\u200ed\u202e'), refused(400, `${'x'.repeat(199)}😀😀`))
+    await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow(/^octo-sts answered 400: a b c d$/)
+    await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow(new RegExp(`^octo-sts answered 400: x{199}😀$`, 'u'))
+  })
+
+  it('redacts an echoed identity token before cutting the message', async () => {
+    const { fetcher, answers } = sts()
+    const long = `eyJ${'a'.repeat(300)}`
+    answers.push(refused(401, `cannot verify ${long}`))
+    await expect(exchange(request, long, fetcher, signal())).rejects.toThrow(/^octo-sts answered 401: cannot verify \[redacted\]$/)
+  })
+
+  it('reads Retry-After on 429 as seconds or a date, at most an hour', async () => {
+    const { fetcher, answers } = sts()
+    const tooMany = (value: string) => () => Response.json({ message: 'slow down' }, { status: 429, headers: { 'retry-after': value } })
+    answers.push(tooMany('120'), tooMany('99999999999999'), tooMany('soon'), tooMany(new Date(Date.now() - 60_000).toUTCString()))
+    const retryAfter = async () => (await exchange(request, IDENTITY_TOKEN, fetcher, signal()).catch((error: ExchangeRefused) => error) as ExchangeRefused).retryAfterMs
+    expect(await retryAfter()).toBe(120_000)
+    expect(await retryAfter()).toBe(MAX_RETRY_AFTER_MS)
+    expect(await retryAfter()).toBeUndefined()
+    expect(await retryAfter()).toBe(0)
   })
 })
 
@@ -338,6 +392,64 @@ describe('TokenRefresher', () => {
     await refresher.stop()
   })
 
+  it('retries a 4xx refusal other than 408 and 429 on the refresh schedule and logs it once', async () => {
+    const { refresher, server, log, advance } = harness()
+    for (let i = 0; i < 3; i++) server.answers.push(refused(403, 'identity not allowed'))
+    refresher.start()
+    await advance(0)
+    expect(log.lines).toEqual([{ level: 'error', text: expect.stringContaining('exchange failed: octo-sts answered 403: identity not allowed; no destination holds a valid token; next attempt in 1800 s') }])
+    await advance(30 * MIN - 1_000)
+    expect(server.calls).toHaveLength(1)
+    await advance(1_000)
+    expect(server.calls).toHaveLength(2)
+    expect(log.lines).toHaveLength(1)
+    server.answers.splice(0, 1, refused(401, 'token expired'))
+    await advance(30 * MIN)
+    expect(server.calls).toHaveLength(3)
+    expect(log.lines).toHaveLength(2)
+    expect(log.lines.at(-1)!.text).toContain('octo-sts answered 401: token expired')
+    await advance(30 * MIN)
+    expect(server.calls).toHaveLength(4)
+    expect(log.lines.at(-1)).toMatchObject({ level: 'info', text: expect.stringContaining('after 3 failed exchanges;') })
+    await refresher.stop()
+  })
+
+  it('waits at most the refresh interval for a huge Retry-After and backs off normally for an unreadable or past one', async () => {
+    const { refresher, server, advance } = harness()
+    const tooMany = (value: string) => () => Response.json({ message: 'slow down' }, { status: 429, headers: { 'retry-after': value } })
+    server.answers.push(tooMany('99999999999999'), tooMany('soon'), tooMany(new Date(0).toUTCString()))
+    refresher.start()
+    await advance(0)
+    await advance(30 * MIN - 1_000)
+    expect(server.calls).toHaveLength(1)
+    await advance(1_000)
+    expect(server.calls).toHaveLength(2)
+    await advance(2 * MIN)
+    expect(server.calls).toHaveLength(3)
+    await advance(4 * MIN)
+    expect(server.calls).toHaveLength(4)
+    await refresher.stop()
+  })
+
+  it('backs off on 408 and 429 and waits at least as long as Retry-After', async () => {
+    const { refresher, server, advance } = harness()
+    server.answers.push(refused(408, 'slow'), () => Response.json({ message: 'slow down' }, { status: 429, headers: { 'retry-after': '600' } }),
+      () => Response.json({ message: 'slow down' }, { status: 429, headers: { 'retry-after': new Date(Date.now() + 20 * MIN).toUTCString() } }))
+    refresher.start()
+    await advance(0)
+    await advance(MIN)
+    expect(server.calls).toHaveLength(2)
+    await advance(10 * MIN - 1_000)
+    expect(server.calls).toHaveLength(2)
+    await advance(1_000)
+    expect(server.calls).toHaveLength(3)
+    await advance(19 * MIN)
+    expect(server.calls).toHaveLength(3)
+    await advance(MIN)
+    expect(server.calls).toHaveLength(4)
+    await refresher.stop()
+  })
+
   it('keeps the previous token on exchange failure, backs off and recovers', async () => {
     const { refresher, server, secrets, log, advance } = harness()
     refresher.start()
@@ -355,7 +467,7 @@ describe('TokenRefresher', () => {
     await advance(2 * MIN)
     expect(server.calls).toHaveLength(4)
     expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token2')
-    expect(log.lines.at(-1)!.text).toContain('after 2 failed attempts')
+    expect(log.lines.at(-1)!.text).toContain('after 2 failed exchanges;')
     expect(JSON.stringify(log.lines)).not.toMatch(/ghs_|eyJ/)
     await refresher.stop()
   })
@@ -467,6 +579,17 @@ describe('TokenRefresher', () => {
     await advance(1_000)
     expect(server.calls).toHaveLength(2)
     expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token2')
+    await refresher.stop()
+  })
+
+  it('recognises the dsh-yawn error texts as of dsh-yawn f96f495', async () => {
+    const { refresher, secrets, log, advance } = harness()
+    secrets.setWorkspaceSecret.mockImplementation(async (url: string) => { throw new Error(`workspace is not registered: ${url}`) })
+    secrets.breakRegistry(() => new Error('repository workspaces require the dsh Web profile'))
+    refresher.start()
+    await advance(0)
+    expect(secrets.createRepositoryWorkspace).toHaveBeenCalledTimes(1)
+    expect(log.lines.at(-1)!.text).toContain(`${WORKSPACE} (retried at the next exchange): could not register`)
     await refresher.stop()
   })
 
@@ -602,6 +725,34 @@ describe('TokenRefresher', () => {
     expect(rejections).toEqual([])
   })
 
+  it('logs and reschedules a round that throws, without an unhandled rejection', async () => {
+    vi.useFakeTimers()
+    const { fetcher, calls } = sts()
+    const log = logger()
+    let broken = true
+    const now = () => { if (broken) throw new Error('clock broke'); return Date.now() }
+    const refresher = new TokenRefresher(config({ workspaces: [] }), { store: () => undefined, logger: log, fetch: fetcher, now })
+    const rejections: unknown[] = []
+    const listener = (reason: unknown) => { rejections.push(reason) }
+    process.on('unhandledRejection', listener)
+    try {
+      refresher.start()
+      await vi.advanceTimersByTimeAsync(0)
+      await refresher.settled()
+      expect(log.lines).toEqual([{ level: 'error', text: 'dsh-octo-sts: acme/dsh-yawn refresh failed: clock broke; next attempt in 60 s' }])
+      broken = false
+      await vi.advanceTimersByTimeAsync(MIN)
+      await refresher.settled()
+      expect(calls).toHaveLength(1)
+      expect(tokenFile()).toBe('ghs_token1')
+      expect(log.lines.at(-1)).toEqual({ level: 'info', text: 'dsh-octo-sts: acme/dsh-yawn token delivered to every destination; next exchange in 30 min' })
+      await refresher.stop()
+    } finally {
+      process.off('unhandledRejection', listener)
+    }
+    expect(rejections).toEqual([])
+  })
+
   it('stops while an exchange is in flight without delivering its token', async () => {
     const { refresher, server, secrets } = harness()
     let release: (response: Response) => void = () => {}
@@ -656,6 +807,166 @@ describe('TokenRefresher', () => {
     await refresher.stop()
   })
 
+  it('delivers the current token again within a minute to a new sandboxManager instance, without a new exchange', async () => {
+    vi.useFakeTimers()
+    const server = sts()
+    let secrets = store({ registered: [WORKSPACE] })
+    const log = logger()
+    const refresher = new TokenRefresher(config(), { store: () => secrets.value, logger: log, fetch: server.fetcher, now: Date.now })
+    refresher.start()
+    await vi.advanceTimersByTimeAsync(0)
+    await refresher.settled()
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
+    await vi.advanceTimersByTimeAsync(5 * MIN)
+    await refresher.settled()
+    expect(secrets.setWorkspaceSecret).toHaveBeenCalledTimes(1)
+    secrets = store({ registered: [WORKSPACE] })
+    await vi.advanceTimersByTimeAsync(MIN)
+    await refresher.settled()
+    expect(secrets.secrets.get(`${WORKSPACE} GITHUB_TOKEN`)).toBe('ghs_token1')
+    expect(server.calls).toHaveLength(1)
+    expect(log.lines).toEqual([
+      { level: 'info', text: 'dsh-octo-sts: acme/dsh-yawn token delivered to every destination; next exchange in 30 min' },
+      { level: 'info', text: `dsh-octo-sts: acme/dsh-yawn token delivered again to ${WORKSPACE}, which had lost it` },
+    ])
+    await refresher.stop()
+  })
+
+  it('does not deliver again when cordis hands out a new proxy of the same sandboxManager on every lookup', async () => {
+    vi.useFakeTimers()
+    const server = sts()
+    const secrets = store({ registered: [WORKSPACE] })
+    const original = Symbol.for('cordis.original')
+    const lookup = () => new Proxy(secrets.value, { get: (target, prop, receiver) => prop === original ? target : Reflect.get(target, prop, receiver) })
+    const refresher = new TokenRefresher(config(), { store: lookup, logger: logger(), fetch: server.fetcher, now: Date.now })
+    refresher.start()
+    for (let i = 0; i < 10; i++) {
+      await vi.advanceTimersByTimeAsync(MIN)
+      await refresher.settled()
+    }
+    expect(secrets.setWorkspaceSecret).toHaveBeenCalledTimes(1)
+    await refresher.stop()
+  })
+
+  it('keeps counting a destination as holding its token while delivering it again fails', async () => {
+    vi.useFakeTimers()
+    const server = sts()
+    const secrets = store({ registered: [WORKSPACE] })
+    let service: SecretStore | undefined = secrets.value
+    const log = logger()
+    const refresher = new TokenRefresher(config({ tokenFile: undefined }), { store: () => service, logger: log, fetch: server.fetcher, now: Date.now })
+    refresher.start()
+    await vi.advanceTimersByTimeAsync(0)
+    await refresher.settled()
+    service = undefined
+    await vi.advanceTimersByTimeAsync(MIN)
+    await refresher.settled()
+    expect(log.lines.at(-1)).toMatchObject({ level: 'warn', text: expect.stringContaining(`${WORKSPACE}: the sandboxManager service is not available; destinations keep their last token until it expires`) })
+    service = store({ registered: [WORKSPACE] }).value
+    await vi.advanceTimersByTimeAsync(MIN)
+    await refresher.settled()
+    expect(log.lines.at(-1)).toEqual({ level: 'info', text: 'dsh-octo-sts: acme/dsh-yawn token delivered to every destination; next exchange in 28 min' })
+    expect(server.calls).toHaveLength(1)
+    await refresher.stop()
+  })
+
+  it('counts only exchange attempts, not repair rounds, in the recovery message', async () => {
+    const { refresher, server, secrets, log, advance } = harness()
+    secrets.registered.add(WORKSPACE)
+    refresher.start()
+    await advance(0)
+    server.answers.push(refused(403, 'identity not allowed'), refused(403, 'identity not allowed'))
+    await advance(30 * MIN)
+    rmSync(join(dir, 'run', 'gh.token'))
+    await advance(2 * MIN)
+    expect(tokenFile()).toBe('ghs_token1')
+    await advance(58 * MIN)
+    expect(server.calls).toHaveLength(4)
+    expect(log.lines.at(-1)).toEqual({ level: 'info', text: 'dsh-octo-sts: acme/dsh-yawn token delivered to every destination after 2 failed exchanges; next exchange in 30 min' })
+    await refresher.stop()
+  })
+
+  it('does not deliver a token again once it has expired', async () => {
+    const { refresher, server, secrets, log, advance } = harness()
+    secrets.registered.add(WORKSPACE)
+    refresher.start()
+    await advance(0)
+    server.answers.push(refused(403, 'identity not allowed'), refused(403, 'identity not allowed'))
+    await advance(61 * MIN)
+    rmSync(join(dir, 'run', 'gh.token'))
+    await advance(5 * MIN)
+    expect(() => tokenFile()).toThrow()
+    expect(log.lines.filter(line => line.text.includes('delivered again'))).toEqual([])
+    await refresher.stop()
+  })
+
+  it('still repairs a lost token file while octo-sts refuses the exchange', async () => {
+    const { refresher, server, secrets, advance } = harness()
+    secrets.registered.add(WORKSPACE)
+    refresher.start()
+    await advance(0)
+    server.answers.push(refused(403, 'identity not allowed'))
+    await advance(30 * MIN)
+    expect(server.calls).toHaveLength(2)
+    rmSync(join(dir, 'run', 'gh.token'))
+    await advance(MIN)
+    expect(tokenFile()).toBe('ghs_token1')
+    expect(server.calls).toHaveLength(2)
+    await advance(29 * MIN - 1_000)
+    expect(server.calls).toHaveLength(2)
+    await advance(1_000)
+    expect(server.calls).toHaveLength(3)
+    await refresher.stop()
+  })
+
+  it('writes the token file again within a minute when it was deleted, without a new exchange', async () => {
+    const { refresher, server, secrets, log, advance } = harness()
+    secrets.registered.add(WORKSPACE)
+    refresher.start()
+    await advance(0)
+    rmSync(join(dir, 'run', 'gh.token'))
+    await advance(MIN)
+    expect(tokenFile()).toBe('ghs_token1')
+    expect(server.calls).toHaveLength(1)
+    expect(secrets.setWorkspaceSecret).toHaveBeenCalledTimes(1)
+    expect(log.lines.at(-1)).toEqual({ level: 'info', text: `dsh-octo-sts: acme/dsh-yawn token delivered again to ${join(dir, 'run', 'gh.token')}, which had lost it` })
+    expect(log.lines).toHaveLength(2)
+    await refresher.stop()
+  })
+
+  it('delivers to every other destination while one write hangs', async () => {
+    const { refresher, secrets, log } = harness({ workspaces: [WORKSPACE, OTHER] })
+    secrets.registered.add(WORKSPACE).add(OTHER)
+    secrets.setWorkspaceSecret.mockImplementation(async (url: string, name: string, secret: string) => {
+      if (url === WORKSPACE) return await new Promise(() => {})
+      secrets.secrets.set(`${url} ${name}`, secret)
+      return {}
+    })
+    refresher.start()
+    await vi.waitFor(() => expect(secrets.secrets.get(`${OTHER} GITHUB_TOKEN`)).toBe('ghs_token1'))
+    expect(tokenFile()).toBe('ghs_token1')
+    expect(log.lines).toEqual([])
+    await vi.advanceTimersByTimeAsync(60_000)
+    await refresher.settled()
+    expect(log.lines.at(-1)!.text).toContain(`${WORKSPACE}: timed out`)
+    await refresher.stop()
+  })
+
+  it('stops at once while a workspace write or registration hangs', async () => {
+    for (const hung of ['write', 'registration'] as const) {
+      const { refresher, secrets } = harness()
+      if (hung === 'write') secrets.setWorkspaceSecret.mockImplementation(() => new Promise(() => {}))
+      else secrets.createRepositoryWorkspace.mockImplementation(() => new Promise(() => {}))
+      refresher.start()
+      await vi.waitFor(() => expect(hung === 'write' ? secrets.setWorkspaceSecret : secrets.createRepositoryWorkspace).toHaveBeenCalled())
+      let stopped = false
+      const stopping = refresher.stop().then(() => { stopped = true })
+      await vi.waitFor(() => expect(stopped, hung).toBe(true))
+      await stopping
+      vi.useRealTimers()
+    }
+  })
+
   it('aborts the exchange in flight on stop', async () => {
     const { refresher, server, secrets, log } = harness()
     vi.mocked(server.fetcher).mockImplementation(async (url, init) => {
@@ -668,6 +979,17 @@ describe('TokenRefresher', () => {
     expect(server.calls[0]!.init.signal!.aborted).toBe(true)
     expect(secrets.secrets.size).toBe(0)
     expect(log.lines).toEqual([])
+  })
+
+  it('logs no part of a long identity token that octo-sts echoes back', async () => {
+    const { refresher, server, log, advance } = harness()
+    writeFileSync(join(dir, 'sa-token'), `eyJ${'b'.repeat(400)}`)
+    server.answers.push(refused(401, `cannot verify eyJ${'b'.repeat(400)}`))
+    refresher.start()
+    await advance(0)
+    expect(log.lines.at(-1)!.text).toContain('octo-sts answered 401: cannot verify [redacted]')
+    expect(JSON.stringify(log.lines)).not.toMatch(/eyJ|bbbb/)
+    await refresher.stop()
   })
 
   it('redacts the identity token from an exchange error in the log', async () => {
@@ -700,7 +1022,7 @@ describe('TokenRefresher with several owners', () => {
     const fetcher = vi.fn(async (url: string | URL | Request) => {
       const scope = new URL(String(url)).searchParams.get('scope')!
       calls.push(scope)
-      if (refusing.has(scope)) return Response.json({ message: `${scope} refused` }, { status: 403 })
+      if (refusing.has(scope)) return Response.json({ message: `${scope} refused` }, { status: 503 })
       const count = (issued.get(scope) ?? 0) + 1
       issued.set(scope, count)
       return Response.json({ token: `ghs_${scope}${count}` })
@@ -744,7 +1066,7 @@ describe('TokenRefresher with several owners', () => {
     expect(secrets.secrets.has(`${GLOBEX} GITHUB_TOKEN`)).toBe(false)
     expect(() => read('globex')).toThrow()
     expect(log.lines).toContainEqual({ level: 'info', text: expect.stringContaining('acme/dsh-yawn token delivered') })
-    expect(log.lines).toContainEqual({ level: 'error', text: expect.stringContaining('globex/dsh-yawn exchange failed: octo-sts answered 403: globex refused') })
+    expect(log.lines).toContainEqual({ level: 'error', text: expect.stringContaining('globex/dsh-yawn exchange failed: octo-sts answered 503: globex refused') })
     await advance(MIN + 2 * MIN + 4 * MIN)
     expect(calls.filter(scope => scope === 'globex')).toHaveLength(4)
     expect(calls.filter(scope => scope === 'acme')).toHaveLength(1)

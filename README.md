@@ -152,6 +152,7 @@ owner="$(printf '%s\n' "${path%%/*}" | tr '[:upper:]' '[:lower:]')"
 [ "$host" = github.com ] || { echo "gh: $host is not github.com" >&2; exit 1; }
 case "$owner" in ''|.*|*[!a-z0-9_.-]*) echo "gh: cannot tell the repository owner" >&2; exit 1 ;; esac
 GH_TOKEN="$(cat "$tokens/$owner.token")" || exit 1
+case "$GH_TOKEN" in *[![:space:]]*) ;; *) echo "gh: $tokens/$owner.token is empty" >&2; exit 1 ;; esac
 export GH_TOKEN
 exec gh "$@"
 ```

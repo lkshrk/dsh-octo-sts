@@ -61,6 +61,14 @@ describe('gh owner wrapper', () => {
     expect(run(['pr', 'list'])).toMatchObject({ status: 1, stdout: '', stderr: 'gh: cannot tell the repository owner\n' })
   })
 
+  it('exits 1 without running gh when the token file is empty or only whitespace', () => {
+    for (const content of ['', '\n', ' \t\n ']) {
+      writeFileSync(join(dir, 'tokens', 'acme.token'), content)
+      expect(run(['pr', 'list', '-R', 'acme/widgets'], { env: { GH_TOKEN: 'ghp_personal' } }), JSON.stringify(content))
+        .toEqual({ status: 1, stdout: '', stderr: `gh: ${join(dir, 'tokens', 'acme.token')} is empty\n` })
+    }
+  })
+
   it('refuses a host other than github.com', () => {
     for (const repo of ['ghe.example.com/acme/widgets', 'https://ghe.example.com/acme/widgets', 'git@ghe.example.com:acme/widgets.git']) {
       expect(run(['pr', 'list', '-R', repo]), repo).toMatchObject({ status: 1, stdout: '', stderr: 'gh: ghe.example.com is not github.com\n' })
