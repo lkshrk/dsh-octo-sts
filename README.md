@@ -1,6 +1,31 @@
 # dsh-octo-sts
 
-A dsh plugin for a [dsh-yawn](https://github.com/zhming0/dsh-yawn) control plane that keeps a short-lived GitHub token from [octo-sts](https://github.com/octo-sts/app) up to date. It exchanges the pod's projected Kubernetes service account token for a GitHub App installation token, stores that token as a workspace secret for the sandboxes, and writes it to a file the control plane's own `gh` can read. No long-lived GitHub credential is needed anywhere.
+A dsh plugin for a [dsh-yawn](https://github.com/zhming0/dsh-yawn) control plane. It keeps short-lived GitHub tokens from [octo-sts](https://github.com/octo-sts/app) up to date, so agents never need a personal access token (PAT).
+
+The plugin exchanges the pod's projected Kubernetes service account token for a GitHub App installation token. It stores that token as a workspace secret for the sandboxes and can also write it to a file for the control plane's own `gh`. It refreshes the token on a schedule and registers missing Workspaces in dsh-yawn.
+
+Why not a PAT:
+
+- **Short lifetime.** An installation token lasts one hour. A leaked token stops working soon after.
+- **Narrow scope.** The trust policy in GitHub decides which repositories and permissions the token gets.
+- **No stored secret.** The only input is the service account token that Kubernetes mounts and rotates.
+
+The plugin runs in the control-plane process only, never in sandboxes.
+
+More detail:
+
+- [docs/architecture.md](docs/architecture.md): components, token flow, scheduling and failure handling.
+- [docs/configuration.md](docs/configuration.md): every configuration key and validation rule.
+- [docs/trust-policies.md](docs/trust-policies.md): the octo-sts side, trust policies and the Kubernetes token.
+
+## Requirements
+
+- dsh `^0.2.1-alpha.2 || ^0.2.2-0` with a dsh-yawn control plane, and Node.js `^22.19.0 || >=24.0.0` (from `engines` in `package.json`).
+- An octo-sts instance, reachable over https from the control plane. The default is `https://sts.h-cloud.io`; set `sts` for your own.
+- The octo-sts GitHub App installed on each owner (organization or user) with access to the target repositories.
+- A trust policy per owner that trusts the control plane's service account token. See [docs/trust-policies.md](docs/trust-policies.md).
+- A projected service account token in the control-plane pod, with the audience your octo-sts expects. The default path is `/var/run/secrets/octo-sts/token`.
+- For workspace registration: the dsh Web profile, which provides `sandboxManager.createRepositoryWorkspace`.
 
 ## Install
 
@@ -8,9 +33,13 @@ A dsh plugin for a [dsh-yawn](https://github.com/zhming0/dsh-yawn) control plane
 dsh plugin --profile <profile> add "github:lkshrk/dsh-octo-sts#<commit>"
 ```
 
-pnpm builds a Git install through the `prepare` script and blocks it until allowed: add the key pnpm prints, `dsh-octo-sts@https://codeload.github.com/lkshrk/dsh-octo-sts/tar.gz/<commit>: true`, under `allowBuilds` in the profile's `pnpm-workspace.yaml`, then run the command again.
+pnpm builds a Git install through the `prepare` script and blocks it until allowed. Add the key pnpm prints, `dsh-octo-sts@https://codeload.github.com/lkshrk/dsh-octo-sts/tar.gz/<commit>: true`, under `allowBuilds` in the profile's `pnpm-workspace.yaml`. Then run the command again.
 
-The bundle inserts the plugin disabled. Enable and configure it in the profile's `cordis.patch.yml`:
+The bundle layer ([`cordis.patch.yml`](cordis.patch.yml)) inserts the plugin disabled. Enable and configure it in the profile's `cordis.patch.yml`.
+
+## Configure
+
+One owner:
 
 ```yaml
 - id: dsh-octo-sts
@@ -23,9 +52,7 @@ The bundle inserts the plugin disabled. Enable and configure it in the profile's
     tokenFile: /run/dsh-octo-sts/github.token
 ```
 
-It runs in the control-plane process only, never in sandboxes.
-
-For repositories under several GitHub owners, list one entry per owner under `owners` instead. Each owner gets its own token, exchanged with its own scope and identity:
+Several owners: list one entry per owner under `owners`. Each owner gets its own token, exchanged with its own scope and identity.
 
 ```yaml
 - id: dsh-octo-sts
@@ -45,31 +72,47 @@ For repositories under several GitHub owners, list one entry per owner under `ow
         tokenFile: /run/dsh-octo-sts/globex.token
 ```
 
-## Configuration
+### Configuration reference
 
 Shared by every owner:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `sts` | `https://sts.h-cloud.io` | octo-sts server root: https, no credentials, path, query or fragment. Redirects are refused |
-| `identityTokenFile` | `/var/run/secrets/octo-sts/token` | The projected service account token, read fresh on every exchange |
-| `refreshMinutes` | `30` | Exchange interval, 5 to 45 minutes, counted from the moment each exchange starts |
-| `registerWorkspaces` | `true` | Register a listed Workspace in dsh-yawn when it is not registered yet; it then shows up in the Web UI |
-| `secretName` | `GITHUB_TOKEN` | Name of the workspace secret |
-| `owners` | none | List of owners, each with the keys below. Leave it out to configure a single owner with those keys at the top level |
+| `sts` | `https://sts.h-cloud.io` | octo-sts server root: https, no credentials, path, query or fragment |
+| `identityTokenFile` | `/var/run/secrets/octo-sts/token` | Absolute path of the projected service account token, read fresh on every exchange |
+| `refreshMinutes` | `30` | Exchange interval in whole minutes, 5 to 45 |
+| `registerWorkspaces` | `true` | Register a listed Workspace in dsh-yawn when it is not registered yet |
+| `secretName` | `GITHUB_TOKEN` | Name of the workspace secret, an environment variable name |
+| `owners` | none | List of owners with the keys below. Leave it out to set those keys at the top level |
 
 Per owner, either at the top level or in each `owners` entry, never both:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `scope` | required | octo-sts scope: an organization or `owner/repo` |
-| `identity` | required | Trust policy name: octo-sts reads `.github/chainguard/<identity>.sts.yaml` in the scope's policy repository |
-| `workspaces` | `[]` | https repository URLs, without credentials, of the dsh-yawn Workspaces that receive the token as a workspace secret |
-| `tokenFile` | none | Absolute path the token is also written to: created with mode 0600 under a random temporary name, then renamed over the old file. A missing parent directory is created with mode 0700 |
+| `scope` | required | octo-sts scope: an owner (`acme`) or a repository (`acme/widgets`) |
+| `identity` | required | Trust policy name: octo-sts reads `.github/chainguard/<identity>.sts.yaml` |
+| `workspaces` | `[]` | `https://github.com/<owner>/<repository>` URLs of the Workspaces that get the token as a secret |
+| `tokenFile` | none | Absolute path the token is also written to |
 
-Each owner needs at least one of `workspaces` and `tokenFile`. Unknown keys are refused, and so is a top-level `scope`, `identity`, `workspaces` or `tokenFile` next to `owners`. In `owners`, two owners may not name the same token file or the same workspace (compared case-insensitively), or the same scope (case-insensitive) with the same identity (case-sensitive, as it names a file). In both forms, every workspace has to be `https://github.com/<owner>/<repository>` with `<owner>` the first part of the scope, and the repository itself when the scope is `owner/repo` (compared case-insensitively). **Breaking change:** the top-level form did not check this before `owners` was added; a configuration with a workspace outside its scope now fails to load.
+Each owner needs at least one of `workspaces` and `tokenFile`. Every workspace has to belong to the owner of its scope. Unknown keys are refused. The full rules are in [docs/configuration.md](docs/configuration.md).
 
-A wrapper around `gh` can read the token file per call:
+**Breaking change:** the top-level form did not check workspaces against the scope before `owners` was added. A configuration with a workspace outside its scope now fails to load.
+
+## Token lifecycle
+
+Each owner runs its own loop. A failing owner never delays or touches another owner's tokens.
+
+1. **Exchange.** The first exchange runs as soon as the plugin starts, then every `refreshMinutes`. The plugin reads the identity token file and calls `GET <sts>/sts/exchange?scope=<scope>&identity=<identity>` with `Authorization: Bearer <identity token>`.
+2. **Delivery.** The token file and each workspace are separate destinations. A new token goes to every destination. A destination that already holds the current token is not written again.
+3. **Workspace registration.** dsh-yawn only stores secrets for Workspaces it has registered. The plugin sets the secret first. Only when dsh-yawn answers `workspace is not registered` does it register the Workspace through `sandboxManager.createRepositoryWorkspace`, then set the secret again. A registered Workspace is never touched. A registered Workspace shows up in the Web UI; set `registerWorkspaces: false` to register Workspaces by hand instead.
+4. **Use in sandboxes.** dsh-yawn hands workspace secrets to sandbox commands as environment variables, so a sandbox sees the token as `GITHUB_TOKEN` (or your `secretName`).
+5. **Failure.** Nothing is ever removed. Every destination keeps its last token, which stays valid until its hour is up. A failed exchange is retried after 1, 2 and 4 minutes, then every 5 minutes.
+
+The token's repositories and permissions come from the trust policy, not from this plugin. See [docs/architecture.md](docs/architecture.md) for the full schedule, timeouts and logs.
+
+## The gh wrapper
+
+The control plane's `gh` can read a token file per call. With one owner, a wrapper can be this short:
 
 ```sh
 #!/bin/sh
@@ -80,7 +123,7 @@ exec gh "$@"
 
 The file appears after the first exchange, a few seconds after dsh starts. A wrapper used at startup should wait for it.
 
-With several owners, name each token file `<owner>.token` after its owner in lower case (`/run/dsh-octo-sts/acme.token`) and let a wrapper pick the file from the target repository: `--repo`/`-R` (also `-ROWNER/REPO` and `--repo=`), then `GH_REPO`, then the `origin` remote of the current directory. It accepts `OWNER/REPO`, `HOST/OWNER/REPO` and https, ssh and scp-style remote URLs, and refuses a host other than `github.com`. [`examples/gh-owner-token.sh`](examples/gh-owner-token.sh), installed under a name other than `gh`:
+With several owners, name each token file `<owner>.token` after its owner in lower case (`/run/dsh-octo-sts/acme.token`). Then let a wrapper pick the file from the target repository. [`examples/gh-owner-token.sh`](examples/gh-owner-token.sh) does that. Install it under a name other than `gh`:
 
 ```sh
 #!/bin/sh
@@ -113,64 +156,45 @@ export GH_TOKEN
 exec gh "$@"
 ```
 
-The wrapper picks by owner only, so use owner-wide scopes (`scope: acme`, not `acme/widgets`) when several owners share it: one token per owner has to cover every repository the wrapper may be called for. `DSH_OCTO_STS_TOKENS` overrides the token directory. Positional repository arguments are not parsed (`gh repo view acme/x`, `gh repo clone acme/x`, PR or issue URLs, `gh api repos/acme/x/...`): the wrapper uses only `-R`/`--repo`, `GH_REPO` and the `origin` remote, so set `GH_REPO` for those calls.
+How it picks the repository, first match wins:
 
-## Behaviour
+1. `-R OWNER/REPO`, `-ROWNER/REPO`, `--repo OWNER/REPO` or `--repo=OWNER/REPO`.
+2. `GH_REPO`.
+3. The `origin` remote of the current directory.
 
-- **Owners.** Each owner runs its own loop: its own exchange, schedule, backoff, destinations and log lines (named `<scope>/<identity>`). A failing owner never delays or touches another owner's tokens.
-- **Exchange.** The first exchange runs as soon as the plugin starts, then every `refreshMinutes`. Each one reads the identity token file and calls `GET <sts>/sts/exchange?scope=<scope>&identity=<identity>` with `Authorization: Bearer <identity token>`.
-- **Destinations.** The token file and each workspace are separate destinations. A new token goes to every destination; a destination that already holds the current token is not written again.
-- **Workspace registration.** dsh-yawn only stores secrets for Workspaces it has registered. With `registerWorkspaces` on, the list in the plugin's configuration is all that is needed, so it stays in Git: the plugin sets the secret first and only when dsh-yawn answers `workspace is not registered` does it register the Workspace through `sandboxManager.createRepositoryWorkspace`, the call the Web UI makes when a repository is opened, then set the secret again. A registered Workspace is never touched. Registration creates a Workspace that shows up in the Web UI; set `registerWorkspaces: false` to avoid that and register Workspaces by hand. One registration per Workspace runs at a time, with a 5 minute limit; a slow one is waited for, not started again. Without the dsh Web profile (`repository workspaces require the dsh Web profile`) or without that method, the Workspace gets a warning and is tried again at the next exchange; the other destinations still get the token.
-- **Delivery to sandboxes.** dsh-yawn re-reads its secret store before every sandbox command, so running and new sandboxes get the new token at their next command without a restart. A single command that runs past the token's expiry keeps the old value.
-- **Failures.** Nothing is ever removed: every destination keeps its last token, which stays valid until its hour is up.
-  - A failed exchange is retried after 1, 2 and 4 minutes, then every 5 minutes.
-  - A destination that could not be written gets the same token again on that backoff, without a new exchange. The others keep their schedule.
-  - With `registerWorkspaces` off, a Workspace dsh-yawn does not know is not retried until the next exchange. The plugin recognises it by dsh-yawn's error text `workspace is not registered`, checked against dsh-yawn 2026.11.12-1090505.
-- **Logs.** Successful exchanges log at info. A failure logs a warning naming the failed exchange or destinations while any destination still holds a valid token, and an error once none does. Token values are never logged; any that appear in an error message are replaced with `[redacted]`. The logs are the plugin's only health report.
-- **Clock and leftovers.** Scheduling uses the monotonic clock, so a wall-clock change does not trigger or delay an exchange. On start, leftover `<tokenFile>.<random>.tmp` files from an interrupted write are removed.
-- **Errors never escape.** dsh ends its process on an unhandled rejection, so every failure stays inside the loop. Disposing the plugin stops the timer, waits for a round in flight and does not deliver its token.
+It accepts `OWNER/REPO`, `HOST/OWNER/REPO` and https, ssh and scp-style remote URLs. It refuses a host other than `github.com`, and it refuses a `GH_HOST` other than `github.com`. `DSH_OCTO_STS_TOKENS` overrides the token directory.
 
-## Trust policy
+Limits of the wrapper:
 
-The token's permissions and repositories come from the trust policy in the scope's organization, `.github/chainguard/<identity>.sts.yaml` in its `.github` repository. The issuer has to be listed in that organization's `.github/chainguard/trusted-token-issuers.yaml`. For a Kubernetes service account token:
+- It never parses positional arguments: `gh repo view acme/x`, `gh repo clone acme/x`, PR or issue URLs and `gh api repos/acme/x/...` paths. Set `GH_REPO` for those calls.
+- It picks by owner only. Use owner-wide scopes (`scope: acme`, not `acme/widgets`) when several owners share it: one token per owner has to cover every repository the wrapper may be called for.
 
-```yaml
-issuer: https://<kubernetes API server issuer>
-subject: system:serviceaccount:<namespace>:<control-plane service account>
-audience: <the projected token's audience, usually the octo-sts domain>
-permissions:
-  contents: write
-  pull_requests: write
-  issues: write
-  checks: read
-  statuses: read
-  actions: read
-repositories:
-  - widgets
-```
+## Troubleshooting
 
-octo-sts must be able to fetch the issuer's discovery document and JWKS anonymously over https, and trust its certificate. The control-plane pod mounts the token as a projected volume with that audience:
+The logs are the plugin's only health report. Each line starts with `dsh-octo-sts: <scope>/<identity>`. Token values are never logged; any that appear in an error message are replaced with `[redacted]`.
 
-```yaml
-volumes:
-  - name: octo-sts-token
-    projected:
-      sources:
-        - serviceAccountToken:
-            path: token
-            audience: sts.example.com
-            expirationSeconds: 3600
-```
+| Log text | Meaning and fix |
+| --- | --- |
+| `token delivered to every destination; next exchange in N min` (info) | Healthy |
+| `exchange failed: <file> is empty` or `exchange failed: ENOENT ...` | The identity token file is empty or missing. Check the projected volume and `identityTokenFile` |
+| `exchange failed: octo-sts answered <status>: <reason>` | octo-sts refused the exchange. Check the trust policy, the trusted issuers file and that the App is installed on the owner. See [docs/trust-policies.md](docs/trust-policies.md) |
+| `exchange failed: octo-sts did not answer within 30 s` | octo-sts is unreachable or slow. Retried on the backoff |
+| `exchange failed: octo-sts answered without a token` | The answer had no `token` field. Check that `sts` points at octo-sts |
+| `<workspace>: the sandboxManager service is not available` | dsh-yawn's sandbox manager is not available yet. Retried on the backoff; the token file still gets the token |
+| `<workspace> (retried at the next exchange): workspace is not registered` | `registerWorkspaces` is off and the Workspace is not registered. Register it, or turn registration on |
+| `<workspace> (retried at the next exchange): could not register the workspace: ... require the dsh Web profile` | Registration needs the dsh Web profile. Enable it, or register the Workspace by hand |
+| `<workspace> (retried at the next exchange): could not register the workspace: sandboxManager has no createRepositoryWorkspace` | This dsh-yawn version lacks the registration method. Register the Workspace by hand |
+| `destinations keep their last token until it expires` (warn) | Something failed, but at least one destination still holds a token younger than one hour |
+| `no destination holds a valid token` (error) | Every delivered token is older than one hour, or none was ever delivered. GitHub calls fail with 401 until the next successful round |
 
-The kubelet rotates the token file before it expires; the plugin reads it on every round.
+Configuration errors stop the plugin from loading. The message names the key and the rule, for example `set scope and identity, or owners` or `... does not belong to acme, the owner of scope acme`.
 
 ## Limits
 
-- **Sandboxes can read the token.** dsh-yawn hands workspace secrets to every command in that Workspace's sandboxes as environment variables. The gain over a personal access token is the lifetime (one hour) and the scope (the policy's repositories and permissions). Keep the policy to the repositories the sandboxes work on.
+- **Sandboxes can read the token.** dsh-yawn hands workspace secrets to every command in that Workspace's sandboxes as environment variables. The gain over a PAT is the lifetime (one hour) and the scope (the policy's repositories and permissions). Keep the policy to the repositories the sandboxes work on.
 - **One hour.** GitHub installation tokens last 60 minutes and cannot be extended. If octo-sts stays unreachable for longer than that, GitHub calls fail with 401 until the next successful round.
-- **Undocumented API.** The plugin uses dsh-yawn's `sandboxManager.createRepositoryWorkspace` and `sandboxManager.setWorkspaceSecret`, public methods of its Cordis service but not a documented plugin API. They were checked against dsh-yawn 2026.11.12-1090505; check them again when upgrading dsh-yawn.
-- **gh wrapper.** The example wrapper reads the repository only from `-R`/`--repo`, `GH_REPO` and the `origin` remote, never from positional arguments, PR or issue URLs or `gh api` paths; set `GH_REPO` for those calls. It refuses hosts other than `github.com`.
 - **One token per owner.** Every workspace of an owner gets the same token, so the owner's trust policy has to cover all of them.
+- **Undocumented API.** The plugin uses dsh-yawn's `sandboxManager.createRepositoryWorkspace` and `sandboxManager.setWorkspaceSecret`. They are public methods of its Cordis service but not a documented plugin API. They were checked against dsh-yawn 2026.11.12-1090505, including the error texts `workspace is not registered` and `repository workspaces require the dsh Web profile`. Check them again when upgrading dsh-yawn.
 
 ## Development
 
@@ -179,4 +203,15 @@ pnpm install
 pnpm check
 ```
 
-Tests stub `fetch` and the secret store; they never call octo-sts.
+| Script | Runs |
+| --- | --- |
+| `pnpm build` | `tsdown`: bundles `src/index.ts` into `lib/` as ESM with type declarations |
+| `pnpm typecheck` | `tsc --noEmit` |
+| `pnpm test` | `vitest run` over `tests/**/*.spec.ts` |
+| `pnpm check` | typecheck, test and build |
+
+Tests stub `fetch` and the secret store; they never call octo-sts. `tests/wrapper.spec.ts` runs the gh wrapper against a fake `gh`, checks that this README shows the exact script from `examples/gh-owner-token.sh`, and runs shellcheck when it is installed. Edit both together.
+
+## License
+
+MIT, as declared in `package.json`.
