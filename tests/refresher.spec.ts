@@ -106,6 +106,19 @@ describe('config', () => {
     expect(OctoStsConfigSchema.safeParse({ ...base, extra: true }).success).toBe(false)
   })
 
+  it('accepts only <owner> or <owner>/<repository> as scope', () => {
+    for (const scope of ['acme', 'Acme-Corp', 'acme/widgets', 'acme/my.repo_name-2', ' acme ']) {
+      expect(OctoStsConfigSchema.safeParse({ ...base, scope, workspaces: [], tokenFile: '/run/gh.token' }).success, scope).toBe(true)
+    }
+    for (const scope of ['', '-acme', 'ac_me', 'acme/', '/widgets', 'acme/widgets/x', 'acme/..', 'acme/.', 'acme/wid gets', 'a'.repeat(40), 'acme/a?b']) {
+      const result = OctoStsConfigSchema.safeParse({ ...base, scope, workspaces: [], tokenFile: '/run/gh.token' })
+      expect(result.success, scope).toBe(false)
+      expect(result.error?.issues.map(issue => `${issue.path.join('.')}: ${issue.message}`), scope).toContain('scope: must be <owner> or <owner>/<repository>')
+    }
+    expect(OctoStsConfigSchema.safeParse({ owners: [{ scope: 'acme/a/b', identity: 'dsh-yawn', tokenFile: '/run/gh.token' }] }).error?.issues[0])
+      .toMatchObject({ path: ['owners', 0, 'scope'], message: 'must be <owner> or <owner>/<repository>' })
+  })
+
   it('accepts only an https server root without credentials as sts', () => {
     expect(OctoStsConfigSchema.safeParse({ ...base, sts: 'https://sts.example.test/' }).success).toBe(true)
     for (const sts of ['http://sts.example.test', 'https://user:pass@sts.example.test', 'https://user@sts.example.test',
