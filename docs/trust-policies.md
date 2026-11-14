@@ -2,17 +2,20 @@
 
 The plugin only asks octo-sts for a token. octo-sts decides whether to issue one and what it can do. That decision comes from a trust policy in GitHub. This page covers what an operator sets up outside the plugin.
 
-The octo-sts behaviour described here comes from the [octo-sts README](https://github.com/octo-sts/app#readme). Check it for the full policy format.
+The octo-sts behaviour described here comes from the [octo-sts README](https://github.com/octo-sts/app#readme), [`pkg/octosts/octosts.go`](https://github.com/octo-sts/app/blob/main/pkg/octosts/octosts.go) and [`pkg/octosts/trust_policy.go`](https://github.com/octo-sts/app/blob/main/pkg/octosts/trust_policy.go). Check them for the full policy format.
 
 ## How the pieces fit
 
-For each owner, the plugin sends `scope` and `identity` with the pod's service account token. octo-sts then:
+For each owner, the plugin sends `scope` and `identity` with the pod's service account token. octo-sts then, in this order:
 
-1. Reads the trust policy `.github/chainguard/<identity>.sts.yaml`.
+1. Checks the token's issuer against the operator's issuer allowlist, if the octo-sts instance has one.
+2. Fetches the issuer's OIDC discovery document and keys, and verifies the token's signature.
+3. Checks the issuer against the owner's `trusted-token-issuers.yaml`, if that file exists.
+4. Reads and parses the trust policy `.github/chainguard/<identity>.sts.yaml`.
    - Scope `acme/widgets`: the file in the `acme/widgets` repository.
-   - Scope `acme`: the file in the owner's `.github` repository, an org-level policy.
-2. Checks the token's issuer, subject and audience against the policy.
-3. Creates an installation token with the policy's permissions, limited to the policy's repositories.
+   - Scope `acme`: the file in the owner's policy repository (`.github` by default), an org-level policy.
+5. Checks the token's issuer, subject, audience and any `claim_pattern` against the policy.
+6. Creates an installation token with the policy's permissions, limited to the policy's repositories.
 
 So `identity` in the plugin's configuration names the policy file, and `scope` picks where octo-sts looks for it.
 
@@ -94,9 +97,22 @@ repositories:
 
 `repositories` limits the token to those repositories. List every repository in the owner's `workspaces` and every repository the gh wrapper may be called for: the plugin delivers one token per owner to all of them.
 
+Without `repositories` (or `repository_ids`), an org-level policy covers every repository the octo-sts App can see in that owner. Do not leave it out in a policy with write permissions: the sandboxes could then write to every repository of the owner.
+
+### Policy fields
+
+- `issuer` or `issuer_pattern`: exactly one is required.
+- `subject` or `subject_pattern`: exactly one is required.
+- `audience` or `audience_pattern`: optional. Without either, the token's audience must contain the octo-sts instance's domain.
+- `claim_pattern`: optional map of claim names to patterns.
+
+The plain fields match exactly. The `_pattern` fields are regular expressions matched against the whole value; do not add `^` or `$`.
+
 ## Repository-level policy
 
-For `scope: acme/widgets`, put the same file in the `acme/widgets` repository and leave out `repositories`. The token then covers only that repository.
+For `scope: acme/widgets`, put the same file in the `acme/widgets` repository, without `repositories`. The token then covers only that repository.
+
+A repository-level policy must not contain `repositories`, `repository_ids` or `caller_repository`. Those are org-level fields, and octo-sts parses a repository-level policy strictly as the plain policy type. An unknown field fails the parse, and octo-sts answers as if the policy did not exist (`unable to find trust policy`).
 
 The plugin refuses workspaces outside a repository scope. A repository scope fits a single-repository owner. It does not fit the multi-owner gh wrapper, which picks a token by owner and needs one token that covers every repository of that owner.
 
@@ -122,11 +138,13 @@ This needs `acme/.github/.github/chainguard/dsh-yawn.sts.yaml` and `globex/.gith
 
 ## When the exchange fails
 
-The plugin logs `exchange failed: octo-sts answered <status>: <reason>` with the reason octo-sts gives. Check, in order:
+The plugin logs `exchange failed: octo-sts answered <status>: <reason>` with the reason octo-sts gives. octo-sts keeps the detailed reason for a policy mismatch in its own logs, not in the answer, so check those too. Then check:
 
 1. The App is installed on the owner and can read the policy repository.
-2. The policy file exists at `.github/chainguard/<identity>.sts.yaml` in the right repository for the scope.
-3. `issuer`, `subject` and `audience` match the token's claims exactly.
-4. The issuer is listed in `trusted-token-issuers.yaml` if that file exists.
-5. octo-sts can reach the issuer's discovery document and JWKS anonymously.
-6. Every repository in `repositories` exists.
+2. The policy file exists at `.github/chainguard/<identity>.sts.yaml` in the right repository for the scope, and parses. A parse error looks like a missing policy.
+3. The issuer is allowed by the operator's issuer allowlist, if the instance has one.
+4. octo-sts can reach the issuer's discovery document and JWKS anonymously.
+5. The issuer is listed in `trusted-token-issuers.yaml` if that file exists.
+6. `issuer`, `subject` and `audience` (or their patterns) match the token's claims.
+7. The GitHub App's own permissions cover every permission in the policy. GitHub refuses to create a token with more than the App has.
+8. Every repository in `repositories` exists.

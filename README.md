@@ -96,7 +96,7 @@ Per owner, either at the top level or in each `owners` entry, never both:
 
 Each owner needs at least one of `workspaces` and `tokenFile`. Every workspace has to belong to the owner of its scope. Unknown keys are refused. The full rules are in [docs/configuration.md](docs/configuration.md).
 
-**Breaking change:** the top-level form did not check workspaces against the scope before `owners` was added. A configuration with a workspace outside its scope now fails to load.
+Since the `owners` form was added, the top-level form checks workspaces against the scope too.
 
 ## Token lifecycle
 
@@ -104,8 +104,8 @@ Each owner runs its own loop. A failing owner never delays or touches another ow
 
 1. **Exchange.** The first exchange runs as soon as the plugin starts, then every `refreshMinutes`. The plugin reads the identity token file and calls `GET <sts>/sts/exchange?scope=<scope>&identity=<identity>` with `Authorization: Bearer <identity token>`.
 2. **Delivery.** The token file and each workspace are separate destinations. A new token goes to every destination. A destination that already holds the current token is not written again.
-3. **Workspace registration.** dsh-yawn only stores secrets for Workspaces it has registered. The plugin sets the secret first. Only when dsh-yawn answers `workspace is not registered` does it register the Workspace through `sandboxManager.createRepositoryWorkspace`, then set the secret again. A registered Workspace is never touched. A registered Workspace shows up in the Web UI; set `registerWorkspaces: false` to register Workspaces by hand instead.
-4. **Use in sandboxes.** dsh-yawn hands workspace secrets to sandbox commands as environment variables, so a sandbox sees the token as `GITHUB_TOKEN` (or your `secretName`).
+3. **Workspace registration.** dsh-yawn only stores secrets for Workspaces it has registered. The plugin sets the secret first. Only when dsh-yawn answers `workspace is not registered` does it register the Workspace through `sandboxManager.createRepositoryWorkspace`, then set the secret again. It never re-registers a Workspace that dsh-yawn already knows. Set `registerWorkspaces: false` to register Workspaces by hand instead, for example to keep dsh-yawn's Workspace list under manual control.
+4. **Use in sandboxes.** The plugin stores the token under `secretName` (default `GITHUB_TOKEN`). How sandboxes receive workspace secrets is up to dsh-yawn, which passes them to sandbox commands as environment variables.
 5. **Failure.** Nothing is ever removed. Every destination keeps its last token, which stays valid until its hour is up. A failed exchange is retried after 1, 2 and 4 minutes, then every 5 minutes.
 
 The token's repositories and permissions come from the trust policy, not from this plugin. See [docs/architecture.md](docs/architecture.md) for the full schedule, timeouts and logs.
@@ -121,7 +121,7 @@ export GH_TOKEN
 exec gh "$@"
 ```
 
-The file appears after the first exchange, a few seconds after dsh starts. A wrapper used at startup should wait for it.
+The file appears after the first successful exchange, which starts as soon as the plugin starts. A wrapper used at startup should wait for it.
 
 With several owners, name each token file `<owner>.token` after its owner in lower case (`/run/dsh-octo-sts/acme.token`). Then let a wrapper pick the file from the target repository. [`examples/gh-owner-token.sh`](examples/gh-owner-token.sh) does that. Install it under a name other than `gh`:
 
@@ -167,7 +167,7 @@ It accepts `OWNER/REPO`, `HOST/OWNER/REPO` and https, ssh and scp-style remote U
 Limits of the wrapper:
 
 - It never parses positional arguments: `gh repo view acme/x`, `gh repo clone acme/x`, PR or issue URLs and `gh api repos/acme/x/...` paths. Set `GH_REPO` for those calls.
-- It picks by owner only. Use owner-wide scopes (`scope: acme`, not `acme/widgets`) when several owners share it: one token per owner has to cover every repository the wrapper may be called for.
+- It picks by owner only. Use owner-wide scopes (`scope: acme`, not `acme/widgets`) when the wrapper serves several repositories of one owner: one token per owner has to cover every repository the wrapper may be called for.
 
 ## Troubleshooting
 
@@ -191,10 +191,10 @@ Configuration errors stop the plugin from loading. The message names the key and
 
 ## Limits
 
-- **Sandboxes can read the token.** dsh-yawn hands workspace secrets to every command in that Workspace's sandboxes as environment variables. The gain over a PAT is the lifetime (one hour) and the scope (the policy's repositories and permissions). Keep the policy to the repositories the sandboxes work on.
+- **Sandboxes can read the token.** A workspace secret is meant for the Workspace's sandboxes; dsh-yawn passes it to their commands as environment variables. The gain over a PAT is the lifetime (one hour) and the scope (the policy's repositories and permissions). Keep the policy to the repositories the sandboxes work on.
 - **One hour.** GitHub installation tokens last 60 minutes and cannot be extended. If octo-sts stays unreachable for longer than that, GitHub calls fail with 401 until the next successful round.
 - **One token per owner.** Every workspace of an owner gets the same token, so the owner's trust policy has to cover all of them.
-- **Undocumented API.** The plugin uses dsh-yawn's `sandboxManager.createRepositoryWorkspace` and `sandboxManager.setWorkspaceSecret`. They are public methods of its Cordis service but not a documented plugin API. They were checked against dsh-yawn 2026.11.12-1090505, including the error texts `workspace is not registered` and `repository workspaces require the dsh Web profile`. Check them again when upgrading dsh-yawn.
+- **Undocumented API.** The plugin uses dsh-yawn's `sandboxManager.createRepositoryWorkspace` and `sandboxManager.setWorkspaceSecret`. They are public methods of its Cordis service but not a documented plugin API. The plugin also matches dsh-yawn's error texts `workspace is not registered` and `require the dsh Web profile`. The tests stub all of this, so check the methods and texts against the dsh-yawn version you run, and again when upgrading it.
 
 ## Development
 

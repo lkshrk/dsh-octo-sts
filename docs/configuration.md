@@ -2,7 +2,7 @@
 
 The plugin's configuration is the `config` block of its row in the profile's `cordis.patch.yml`. [`src/config.ts`](../src/config.ts) defines it as a zod schema, exported as `Config`, which Cordis validates on load. An invalid configuration stops the plugin from loading; the error names the key and the rule.
 
-String values are trimmed before they are checked, except `secretName`.
+Leading and trailing whitespace is trimmed from `scope`, `identity`, `identityTokenFile` and `tokenFile` (zod `.trim()`), and from `sts` and each workspace (zod 4.4.3's `z.url()` trims its input). `secretName` is not trimmed: a value with surrounding whitespace is refused.
 
 ## Two forms
 
@@ -70,6 +70,10 @@ When `tokenFile` is set, each new token is written like this:
 When the plugin starts, it removes leftover `<tokenFile>.<16 hex characters>.tmp` files from an interrupted write. It touches no other files in the directory.
 
 The file holds the bare token without a trailing newline. A memory-backed volume (an `emptyDir` with `medium: Memory`) keeps it off disk.
+
+The file has mode `0600`, so only the user dsh runs as can read it. Run `gh` and the gh wrapper as that same user. A directory the plugin creates gets `0700`; an existing directory, such as a volume mount, keeps its mode.
+
+Do not set `tokenFile` to the same path as `identityTokenFile`. The configuration does not refuse it, but the plugin would overwrite the service account token with the GitHub token. On a projected volume the write fails instead, because Kubernetes mounts projected volumes read-only.
 
 ## Examples
 

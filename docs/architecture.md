@@ -22,7 +22,7 @@ flowchart LR
 
 - **kubelet** mounts and rotates the projected service account token.
 - **octo-sts** checks that token against the trust policy in GitHub and returns an installation token.
-- **dsh-yawn's `sandboxManager`** stores workspace secrets and hands them to sandbox commands.
+- **dsh-yawn's `sandboxManager`** stores workspace secrets. Handing them to sandbox commands is dsh-yawn's job, not the plugin's.
 - **The gh wrapper** reads a token file per `gh` call. See the README.
 
 ## Source layout
@@ -55,7 +55,7 @@ flowchart TB
 
 - `TokenRefresher` creates one `OwnerRefresher` per owner and starts and stops them together.
 - `OwnerRefresher` holds the owner's current token, the time it was issued, the delivery state of each destination and the failure count.
-- The registrations in flight are shared across owners and keyed by workspace URL.
+- Registrations in flight are kept in a map keyed by the exact workspace URL. A registration that outlives its 5 minute limit stays in the map until it settles, so the next round waits for it instead of starting another.
 
 ## Token flow
 
@@ -72,8 +72,9 @@ sequenceDiagram
 
   R->>F: read and trim
   R->>S: GET /sts/exchange?scope&identity, bearer identity token
+  S->>S: verify the token against the issuer's keys
   S->>G: read the trust policy
-  S->>S: verify issuer, subject, audience
+  S->>S: check issuer, subject, audience
   S->>G: create installation token
   S-->>R: {"token": "..."}
   R->>T: write temp file 0600, rename
@@ -84,14 +85,14 @@ sequenceDiagram
   R->>R: log, schedule next round
 ```
 
-The steps on the octo-sts side are octo-sts behaviour, shown for context.
+The steps on the octo-sts side are simplified octo-sts behaviour, shown for context. See [trust-policies.md](trust-policies.md#how-the-pieces-fit) for the order of its checks.
 
 ### Exchange
 
 [`exchange`](../src/exchange.ts) sends `GET <sts>/sts/exchange` with the query parameters `scope` and `identity` and the headers `Authorization: Bearer <identity token>` and `Accept: application/json`. It refuses redirects and gives up after 30 seconds.
 
 - A `2xx` answer must be JSON with a non-empty `token` string. Anything else fails with `octo-sts answered without a token`.
-- A non-`2xx` answer fails with `octo-sts answered <status>: <reason>`. The reason is the `message` field of a JSON body, cut to 200 characters, or else the HTTP status text.
+- A non-`2xx` answer fails with `octo-sts answered <status>: <reason>`. The reason is the `message` field of a JSON body, cut to 200 characters. Without a JSON body or a `message` field, it is the HTTP status text, or `no reason given` when that is empty.
 
 ### Delivery
 
@@ -139,13 +140,13 @@ One line per round at most, prefixed `dsh-octo-sts: <scope>/<identity>`.
 - **warn** when the exchange or a destination failed but at least one destination holds a token younger than one hour.
 - **error** when no destination holds such a token.
 
-Failure lines list each problem and the delay until the next attempt. The identity token and the GitHub token are replaced with `[redacted]` in any error text. A logger that throws is ignored.
+Failure lines list each problem and the delay until the next attempt. Exchange errors have the identity token replaced with `[redacted]`; destination errors have the GitHub token replaced. A logger that throws is ignored.
 
 ## Lifecycle and errors
 
 - `apply` registers a Cordis effect labelled `octo-sts: token refresh`. Disposing it calls `stop`.
 - `stop` aborts the exchange in flight, clears the timer and waits for the running round. A token from an aborted round is not delivered.
-- dsh ends its process on an unhandled rejection, so every error stays inside the loop. A round never rejects, even when every dependency throws.
+- Every error stays inside the loop: a round never rejects, even when every dependency throws (covered by the tests). Node.js ends the process on an unhandled rejection by default, which would take dsh down with it.
 
 ## Public exports
 
