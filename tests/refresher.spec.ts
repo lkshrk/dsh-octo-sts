@@ -211,6 +211,22 @@ describe('exchange', () => {
     await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('without a token')
     await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow('without a token')
   })
+
+  it('names the network cause of a failed fetch without the identity token', async () => {
+    const failing = (cause: unknown) => vi.fn(async () => { throw new TypeError('fetch failed', { cause }) }) as unknown as typeof fetch
+    const refusedConnection = Object.assign(new Error('connect ECONNREFUSED 10.0.0.1:443'), { code: 'ECONNREFUSED' })
+    await expect(exchange(request, IDENTITY_TOKEN, failing(refusedConnection), signal())).rejects.toThrow(/^fetch failed: ECONNREFUSED$/)
+    await expect(exchange(request, IDENTITY_TOKEN, failing(new Error(`certificate has expired\nfor ${IDENTITY_TOKEN}`)), signal()))
+      .rejects.toThrow(/^fetch failed: certificate has expired for \[redacted\]$/)
+    await expect(exchange(request, IDENTITY_TOKEN, failing(undefined), signal())).rejects.toThrow(/^fetch failed$/)
+  })
+
+  it('strips control characters from the octo-sts message and keeps 200 characters', async () => {
+    const { fetcher, answers } = sts()
+    answers.push(refused(400, 'bad\nrequest\r\n\u001b[31mforged line'), refused(400, 'x'.repeat(250)))
+    await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow(/^octo-sts answered 400: bad request \[31mforged line$/)
+    await expect(exchange(request, IDENTITY_TOKEN, fetcher, signal())).rejects.toThrow(new RegExp(`^octo-sts answered 400: x{200}$`))
+  })
 })
 
 describe('readIdentityToken', () => {

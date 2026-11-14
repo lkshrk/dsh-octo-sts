@@ -14,11 +14,16 @@ export async function exchange(request: ExchangeRequest, identityToken: string, 
   const timeout = new AbortController()
   const timer = setTimeout(() => timeout.abort(new Error(`octo-sts did not answer within ${EXCHANGE_TIMEOUT_MS / 1000} s`)), EXCHANGE_TIMEOUT_MS)
   try {
-    const response = await fetcher(url, {
-      redirect: 'error',
-      headers: { authorization: `Bearer ${identityToken}`, accept: 'application/json' },
-      signal: AbortSignal.any([signal, timeout.signal]),
-    })
+    let response: Response
+    try {
+      response = await fetcher(url, {
+        redirect: 'error',
+        headers: { authorization: `Bearer ${identityToken}`, accept: 'application/json' },
+        signal: AbortSignal.any([signal, timeout.signal]),
+      })
+    } catch (error) {
+      throw withCause(error, identityToken)
+    }
     if (!response.ok) throw new Error(`octo-sts answered ${response.status}: ${await reason(response)}`)
     const parsed = TokenSchema.safeParse(await response.json().catch(() => undefined))
     if (!parsed.success) throw new Error('octo-sts answered without a token')
@@ -31,8 +36,20 @@ export async function exchange(request: ExchangeRequest, identityToken: string, 
   }
 }
 
+function withCause(error: unknown, identityToken: string): unknown {
+  if (!(error instanceof Error) || typeof error.cause !== 'object' || error.cause === null) return error
+  const { code, message } = error.cause as { code?: unknown; message?: unknown }
+  const detail = typeof code === 'string' ? code : typeof message === 'string' ? message : ''
+  if (!detail) return error
+  return new Error(printable(`${error.message}: ${detail}`).replaceAll(identityToken, '[redacted]'), { cause: error })
+}
+
 async function reason(response: Response): Promise<string> {
   const body = await response.json().catch(() => undefined)
   const parsed = ErrorSchema.safeParse(body)
-  return parsed.success ? parsed.data.message.slice(0, 200) : response.statusText || 'no reason given'
+  return printable(parsed.success ? parsed.data.message : response.statusText).slice(0, 200) || 'no reason given'
+}
+
+function printable(text: string): string {
+  return text.replace(/\p{Cc}+/gu, ' ').trim()
 }
