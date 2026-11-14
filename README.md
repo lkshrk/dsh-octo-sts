@@ -214,4 +214,4 @@ Tests stub `fetch` and the secret store; they never call octo-sts. `tests/wrappe
 
 ## License
 
-MIT, as declared in `package.json`.
+MIT. See [LICENSE](LICENSE).
