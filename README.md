@@ -89,7 +89,7 @@ Per owner, either at the top level or in each `owners` entry, never both:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `scope` | required | octo-sts scope: an owner (`acme`) or a repository (`acme/widgets`) |
+| `scope` | required | octo-sts scope: `<owner>` (`acme`) or `<owner>/<repository>` (`acme/widgets`) |
 | `identity` | required | Trust policy name: octo-sts reads `.github/chainguard/<identity>.sts.yaml` |
 | `workspaces` | `[]` | `https://github.com/<owner>/<repository>` URLs of the Workspaces that get the token as a secret |
 | `tokenFile` | none | Absolute path the token is also written to |
@@ -103,10 +103,11 @@ Since the `owners` form was added, the top-level form checks workspaces against 
 Each owner runs its own loop. A failing owner never delays or touches another owner's tokens.
 
 1. **Exchange.** The first exchange runs as soon as the plugin starts, then every `refreshMinutes`. The plugin reads the identity token file and calls `GET <sts>/sts/exchange?scope=<scope>&identity=<identity>` with `Authorization: Bearer <identity token>`.
-2. **Delivery.** The token file and each workspace are separate destinations. A new token goes to every destination. A destination that already holds the current token is not written again.
+2. **Delivery.** The token file and each workspace are separate destinations. A new token goes to every destination at the same time, so a hung destination does not hold up the others. A destination that already holds the current token is not written again.
 3. **Workspace registration.** dsh-yawn only stores secrets for Workspaces it has registered. The plugin sets the secret first. Only when dsh-yawn answers `workspace is not registered` does it register the Workspace through `sandboxManager.createRepositoryWorkspace`, then set the secret again. It never re-registers a Workspace that dsh-yawn already knows. Set `registerWorkspaces: false` to register Workspaces by hand instead, for example to keep dsh-yawn's Workspace list under manual control.
 4. **Use in sandboxes.** The plugin stores the token under `secretName` (default `GITHUB_TOKEN`). How sandboxes receive workspace secrets is up to dsh-yawn, which passes them to sandbox commands as environment variables.
-5. **Failure.** Nothing is ever removed. Every destination keeps its last token, which stays valid until its hour is up. A failed exchange is retried after 1, 2 and 4 minutes, then every 5 minutes.
+5. **Repair.** Between exchanges, a check runs about once a minute while nothing is backing off. A token file that was deleted, or a Workspace whose sandboxManager instance was replaced, gets the current token again without a new exchange, as long as that token is younger than one hour.
+6. **Failure.** Nothing is ever removed. Every destination keeps its last token, which stays valid until its hour is up. A failed exchange is retried after 1, 2 and 4 minutes, then every 5 minutes. A `429` waits at least its `Retry-After`, up to `refreshMinutes`. Any other `4xx` refusal is retried after `refreshMinutes`, because the same request would be refused again.
 
 The token's repositories and permissions come from the trust policy, not from this plugin. See [docs/architecture.md](docs/architecture.md) for the full schedule, timeouts and logs.
 
@@ -116,7 +117,9 @@ The control plane's `gh` can read a token file per call. With one owner, a wrapp
 
 ```sh
 #!/bin/sh
-GH_TOKEN="$(cat /run/dsh-octo-sts/github.token)" || exit 1
+file=/run/dsh-octo-sts/github.token
+GH_TOKEN="$(cat "$file")" || exit 1
+case "$GH_TOKEN" in *[![:space:]]*) ;; *) echo "gh: $file is empty" >&2; exit 1 ;; esac
 export GH_TOKEN
 exec gh "$@"
 ```
@@ -163,7 +166,7 @@ How it picks the repository, first match wins:
 2. `GH_REPO`.
 3. The `origin` remote of the current directory.
 
-It accepts `OWNER/REPO`, `HOST/OWNER/REPO` and https, ssh and scp-style remote URLs. It refuses a host other than `github.com`, and it refuses a `GH_HOST` other than `github.com`. `DSH_OCTO_STS_TOKENS` overrides the token directory.
+It accepts `OWNER/REPO`, `HOST/OWNER/REPO` and https, ssh and scp-style remote URLs. It refuses a host other than `github.com`, a `GH_HOST` other than `github.com`, and an empty or whitespace-only token file (`gh: <file> is empty`). `DSH_OCTO_STS_TOKENS` overrides the token directory.
 
 Limits of the wrapper:
 
@@ -177,8 +180,12 @@ The logs are the plugin's only health report. Each line starts with `dsh-octo-st
 | Log text | Meaning and fix |
 | --- | --- |
 | `token delivered to every destination; next exchange in N min` (info) | Healthy |
+| `token delivered to every destination after N failed exchange(s); next exchange in N min` (info) | Recovered after failed exchanges |
+| `token delivered again to <destinations>, which had lost it` (info) | A token file was deleted or the sandboxManager instance was replaced; the plugin repaired it |
 | `exchange failed: <file> is empty` or `exchange failed: ENOENT ...` | The identity token file is empty or missing. Check the projected volume and `identityTokenFile` |
-| `exchange failed: octo-sts answered <status>: <reason>` | octo-sts refused the exchange. Check the trust policy, the trusted issuers file and that the App is installed on the owner. See [docs/trust-policies.md](docs/trust-policies.md) |
+| `exchange failed: octo-sts answered <4xx>: <reason>` | octo-sts refused the exchange. Check the trust policy, the trusted issuers file and that the App is installed on the owner. See [docs/trust-policies.md](docs/trust-policies.md). Retried after `refreshMinutes` and logged once until the text or level changes; `408` and `429` are retried on the backoff instead |
+| `exchange failed: octo-sts answered <5xx>: <reason>` | octo-sts or GitHub is failing. Retried on the backoff |
+| `exchange failed: fetch failed: <cause>` | The request failed, for example `ECONNREFUSED` or a TLS error. Check that `sts` is reachable from the pod. Retried on the backoff |
 | `exchange failed: octo-sts did not answer within 30 s` | octo-sts is unreachable or slow. Retried on the backoff |
 | `exchange failed: octo-sts answered without a token` | The answer had no `token` field. Check that `sts` points at octo-sts |
 | `<workspace>: the sandboxManager service is not available` | dsh-yawn's sandbox manager is not available yet. Retried on the backoff; the token file still gets the token |
@@ -187,15 +194,16 @@ The logs are the plugin's only health report. Each line starts with `dsh-octo-st
 | `<workspace> (retried at the next exchange): could not register the workspace: sandboxManager has no createRepositoryWorkspace` | This dsh-yawn version lacks the registration method. Register the Workspace by hand |
 | `destinations keep their last token until it expires` (warn) | Something failed, but at least one destination still holds a token younger than one hour |
 | `no destination holds a valid token` (error) | Every delivered token is older than one hour, or none was ever delivered. GitHub calls fail with 401 until the next successful round |
+| `refresh failed: <error>` (error) | An unexpected error in the refresh round. The plugin keeps running and retries on the backoff. Report it with the log line |
 
-Configuration errors stop the plugin from loading. The message names the key and the rule, for example `set scope and identity, or owners` or `... does not belong to acme, the owner of scope acme`.
+Configuration errors stop the plugin from loading. The message names the key and the rule, for example `set scope and identity, or owners`, `must be <owner> or <owner>/<repository>` or `... does not belong to acme, the owner of scope acme`.
 
 ## Limits
 
 - **Sandboxes can read the token.** A workspace secret is meant for the Workspace's sandboxes; dsh-yawn passes it to their commands as environment variables. The gain over a PAT is the lifetime (one hour) and the scope (the policy's repositories and permissions). Keep the policy to the repositories the sandboxes work on.
 - **One hour.** GitHub installation tokens last 60 minutes and cannot be extended. If octo-sts stays unreachable for longer than that, GitHub calls fail with 401 until the next successful round.
 - **One token per owner.** Every workspace of an owner gets the same token, so the owner's trust policy has to cover all of them.
-- **Undocumented API.** The plugin uses dsh-yawn's `sandboxManager.createRepositoryWorkspace` and `sandboxManager.setWorkspaceSecret`. They are public methods of its Cordis service but not a documented plugin API. The plugin also matches dsh-yawn's error texts `workspace is not registered` and `require the dsh Web profile`. The tests stub all of this, so check the methods and texts against the dsh-yawn version you run, and again when upgrading it.
+- **Undocumented API.** The plugin uses dsh-yawn's `sandboxManager.createRepositoryWorkspace` and `sandboxManager.setWorkspaceSecret`. They are public methods of its Cordis service but not a documented plugin API. The plugin also matches dsh-yawn's error texts `workspace is not registered` and `require the dsh Web profile`. The tests stub all of this and pin the error texts as of dsh-yawn commit `f96f495`. Check the methods and texts against the dsh-yawn version you run, and again when upgrading it.
 
 ## Development
 

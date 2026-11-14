@@ -41,7 +41,7 @@ Rules:
 
 Rules:
 
-- `scope` must be non-empty. Use an owner (`acme`) or a repository (`acme/widgets`). The plugin does not check that the owner or repository exists; octo-sts does.
+- `scope` must be `<owner>` or `<owner>/<repository>` (`must be <owner> or <owner>/<repository>`). `<owner>` is 1 to 39 letters, digits or hyphens, starting with a letter or digit. `<repository>` is 1 to 100 letters, digits, `.`, `_` or `-`, and not `.` or `..`. The plugin does not check that the owner or repository exists; octo-sts does.
 - `identity` must be a single path segment: non-empty, without `/`, whitespace or control characters, and not `.` or `..`. octo-sts reads `.github/chainguard/<identity>.sts.yaml`.
 - Each workspace must be an `https` URL without credentials, of the form `https://github.com/<owner>/<repository>`. A trailing `/` or `.git` is accepted. A port, query or fragment is refused.
 - Each workspace must belong to the scope: `<owner>` must equal the scope's owner part. When the scope is `owner/repo`, `<repository>` must equal that repository too. Both comparisons ignore case. The error is `<url> does not belong to <owner>, the owner of scope <scope>` or `<url> is outside scope <scope>`.

@@ -138,7 +138,11 @@ This needs `acme/.github/.github/chainguard/dsh-yawn.sts.yaml` and `globex/.gith
 
 ## When the exchange fails
 
-The plugin logs `exchange failed: octo-sts answered <status>: <reason>` with the reason octo-sts gives. octo-sts keeps the detailed reason for a policy mismatch in its own logs, not in the answer, so check those too. Then check:
+The plugin logs `exchange failed: octo-sts answered <status>: <reason>` with the reason octo-sts gives. octo-sts keeps the detailed reason for a policy mismatch in its own logs, not in the answer, so check those too.
+
+The plugin retries a `4xx` refusal (other than `408` and `429`) only after `refreshMinutes`, and logs it once until the text changes. After fixing a policy, expect the next exchange up to `refreshMinutes` later, or restart the plugin to exchange at once.
+
+Then check:
 
 1. The App is installed on the owner and can read the policy repository.
 2. The policy file exists at `.github/chainguard/<identity>.sts.yaml` in the right repository for the scope, and parses. A parse error looks like a missing policy.
